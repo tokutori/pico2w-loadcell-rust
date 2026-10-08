@@ -1,0 +1,19 @@
+[package]
+name = "pico2w-loadcells"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+loadcell-core = { path = "../loadcell-core" }
+embassy-rp = { version = "0.10.0", features = ["rp235xa", "time-driver", "critical-section-impl", "executor-thread"] }
+embassy-executor = "0.10.0"
+embassy-futures = "0.1.2"
+embassy-time = "0.5.1"
+embassy-usb = "0.6.0"
+static_cell = "2.1"
+heapless = "0.9"
+cortex-m = "0.7.7"
+cortex-m-rt = "0.7"
+panic-halt = "1.0"
