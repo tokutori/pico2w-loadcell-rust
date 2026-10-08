@@ -95,7 +95,7 @@ Real sensitivity and mounting conditions vary. For each sensor:
 4. Reflash; remove all loads and let tare complete again.
 
 When obtaining zero, use the average of multiple samples; the firmware already
-performs 12-sample averaging on USB connection. The displayed `delta` is
+performs 12-sample averaging when the terminal opens. The displayed `delta` is
 `raw - zero`, so for `m_ref`, `COUNTS_PER_KG = delta / m_ref` directly.
 
 **Caution:** the SC134's 50 kg rating applies per sensor. Mounting geometry,
@@ -110,11 +110,16 @@ sheet describes a wider range.
 - Source pin map and protocols checked against manufacturer documentation.
 - RP2350 memory layout and image-definition placement supplied via `firmware/memory.x` and `firmware/build.rs`.
 - `loadcell-core` includes unit tests intended for `cargo test -p loadcell-core --target <host triple>`.
-- RP2350 ARM release build, UF2 generation, host core tests (3 unit tests and
-  1 doctest), Clippy with `-D warnings`, and formatting were checked before
-  adding the Verus annotations.
-- Verus contracts are being added to the actual core implementation; formal
-  verification and the final build checks are pending.
+- RP2350 ARM release build and UF2 generation succeeded with the Verus-annotated
+  core. UF2 family ID, boot image definition, vector table, and ELF payload
+  consistency were checked.
+- Host core tests (4 unit tests and 1 doctest), Clippy with `-D warnings`, and
+  formatting passed.
+- Verus 0.2026.10.04.426d8b0 verified the actual core implementation:
+  `10 verified, 0 errors`. Deliberately corrupting the decoder is rejected
+  by its postconditions.
+- The dependency `proc-macro-error2 2.0.1` emits a Rust future-incompatibility
+  warning; the current build succeeds and the warning remains visible.
 - Firmware **has not been exercised on hardware in this environment**.
 - The repo's global ARM target can be overridden on a host with:
   `cargo test -p loadcell-core --target x86_64-pc-windows-msvc` (Windows MSVC),
@@ -134,7 +139,7 @@ and Rust 1.98.1, then add the extracted Verus directory to `PATH`:
 
 ```powershell
 rustup toolchain install 1.98.1 --profile minimal
-cargo +1.98.1 verus verify -p loadcell-core --target x86_64-pc-windows-msvc --locked
+cargo +1.98.1 verus verify -p loadcell-core --locked --target x86_64-pc-windows-msvc
 ```
 
 The verification target is the host; firmware builds continue to use
