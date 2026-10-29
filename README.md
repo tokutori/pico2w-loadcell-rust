@@ -81,6 +81,13 @@ LC3 raw=893012 delta=153900 kg~=1.991
 LC4 status=timeout
 ```
 
+## PC serial monitor and plotter
+
+For simultaneous raw-text monitoring and live LC1-LC4 graphs, see the
+[PC serial plotter](tools/serial-plotter/README.md). From PowerShell, launch it
+with `.\tools\serial-plotter\run.ps1 -Port COM5`. Close other serial monitors
+before connecting. Only LC1 is selected for plotting by default.
+
 ## Calibrating accurately
 
 This exact load cell is nominally 1.8 mV/V at 50 kg; at HX711 gain 128,
