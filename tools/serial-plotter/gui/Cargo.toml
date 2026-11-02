@@ -6,9 +6,16 @@ rust-version.workspace = true
 
 [dependencies]
 serial-plotter-core = { path = "../core" }
+loadcell-link = { path = "../../../loadcell-link" }
+btleplug = "=0.13.5"
+tokio = { version = "1", features = ["rt", "time", "macros"] }
+futures-util = "0.3"
+uuid = "1"
 eframe = { version = "=0.33.3", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 egui_plot = "=0.34.1"
 serialport = { version = "=4.10.1", default-features = false }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 
 [lints]
 workspace = true

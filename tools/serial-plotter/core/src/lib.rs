@@ -36,10 +36,12 @@ impl Channel {
 pub enum Fault {
     Timeout,
     Saturated,
+    Protocol,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Measurement {
+    Raw { raw: i32 },
     Sample { raw: i32, delta: i64, kg: f64 },
     Untared { raw: i32 },
     Fault(Fault),
@@ -74,7 +76,9 @@ impl Measurement {
     /// Missing measurements remain missing; never substitute zero for faults.
     pub fn value(self, metric: Metric) -> Option<f64> {
         match (self, metric) {
-            (Self::Sample { raw, .. } | Self::Untared { raw }, Metric::Raw) => Some(f64::from(raw)),
+            (Self::Sample { raw, .. } | Self::Untared { raw } | Self::Raw { raw }, Metric::Raw) => {
+                Some(f64::from(raw))
+            }
             (Self::Sample { delta, .. }, Metric::Delta) => Some(delta as f64),
             (Self::Sample { kg, .. }, Metric::Kg) => Some(kg),
             _ => None,
@@ -89,10 +93,93 @@ pub enum ParseError {
     Number,
 }
 
+/// Firmware diagnostics carry state or loss information, never weight values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Diagnostic {
+    SessionStarted,
+    TareStarted,
+    TareComplete,
+    TareFailed { channel: Channel, required: u16 },
+    Dropped { channel: Channel, count: u32 },
+}
+
+/// Parse the current firmware's diagnostics without allocating. Unknown boot
+/// text is retained by the caller as plain text. Malformed recognized loss/tare
+/// failure lines are errors rather than silently trusted counts.
+pub fn parse_diagnostic(line: &str) -> Result<Option<Diagnostic>, ParseError> {
+    let line = line.trim();
+    if line == "Session started. Raw output; zero and calibration are PC-side." {
+        return Ok(Some(Diagnostic::SessionStarted));
+    }
+    if line == "Remove all loads; tare starts in 3 seconds." {
+        return Ok(Some(Diagnostic::TareStarted));
+    }
+    if line == "Tare complete." || line == "Tare complete. 'kg~' is NOMINAL, not calibrated." {
+        return Ok(Some(Diagnostic::TareComplete));
+    }
+    let mut fields = line.split_ascii_whitespace();
+    match fields.next() {
+        Some("Dropped") => {
+            let channel = parse_channel(fields.next().ok_or(ParseError::Format)?)?;
+            let count = number(fields.next().ok_or(ParseError::Format)?, "samples=")?;
+            if count == 0
+                || !matches!(
+                    (fields.next(), fields.next(), fields.next()),
+                    (Some("(USB" | "(transport"), Some("backlog)"), None)
+                )
+            {
+                return Err(ParseError::Format);
+            }
+            Ok(Some(Diagnostic::Dropped { channel, count }))
+        }
+        Some("Tare") => {
+            let Some(label) = fields.next().filter(|label| label.starts_with("LC")) else {
+                return Ok(None);
+            };
+            let channel = parse_channel(label)?;
+            if fields.next() != Some("failed:") {
+                return Err(ParseError::Format);
+            }
+            let required = number(fields.next().ok_or(ParseError::Format)?, "")?;
+            if required == 0
+                || [
+                    fields.next(),
+                    fields.next(),
+                    fields.next(),
+                    fields.next(),
+                    fields.next(),
+                    fields.next(),
+                ] != [
+                    Some("valid"),
+                    Some("samples"),
+                    Some("required;"),
+                    Some("reconnect"),
+                    Some("unloaded."),
+                    None,
+                ]
+            {
+                return Err(ParseError::Format);
+            }
+            Ok(Some(Diagnostic::TareFailed { channel, required }))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn parse_channel(label: &str) -> Result<Channel, ParseError> {
+    match label {
+        "LC1" => Ok(Channel::Lc1),
+        "LC2" => Ok(Channel::Lc2),
+        "LC3" => Ok(Channel::Lc3),
+        "LC4" => Ok(Channel::Lc4),
+        _ => Err(ParseError::Channel),
+    }
+}
+
 /// Parse one complete firmware line in O(line length), without I/O or allocation.
 ///
 /// Unrelated boot/terminal text returns `Ok(None)`. LC-prefixed malformed lines
-/// return an error. Only the three documented firmware layouts are accepted;
+/// return an error. Raw-only, legacy calibrated/untared and fault layouts are accepted;
 /// non-finite weights, unknown channels and trailing tokens are rejected.
 /// Values including `raw=-1` and zero are preserved without filtering.
 ///
@@ -118,6 +205,10 @@ pub fn parse_line(line: &str) -> Result<Option<Reading>, ParseError> {
     let measurement = match (fields.next(), fields.next(), fields.next(), fields.next()) {
         (Some("status=timeout"), None, None, None) => Measurement::Fault(Fault::Timeout),
         (Some("status=saturated"), None, None, None) => Measurement::Fault(Fault::Saturated),
+        (Some("status=protocol"), None, None, None) => Measurement::Fault(Fault::Protocol),
+        (Some(raw), None, None, None) => Measurement::Raw {
+            raw: number(raw, "raw=")?,
+        },
         (Some(raw), Some("status=no_tare"), None, None) => Measurement::Untared {
             raw: number(raw, "raw=")?,
         },

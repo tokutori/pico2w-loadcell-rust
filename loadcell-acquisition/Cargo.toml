@@ -1,0 +1,16 @@
+[package]
+name = "loadcell-acquisition"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+embassy-futures = "0.1.2"
+embassy-sync = "0.8.0"
+
+[target.'cfg(not(target_os = "none"))'.dev-dependencies]
+critical-section = { version = "1.2", features = ["std"] }
+
+[lints.rust]
+unsafe_code = "forbid"

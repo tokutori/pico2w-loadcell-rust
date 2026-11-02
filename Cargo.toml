@@ -1,5 +1,5 @@
 [workspace]
-members = ["loadcell-core", "firmware"]
+members = ["loadcell-core", "loadcell-acquisition", "loadcell-link", "firmware"]
 resolver = "2"
 
 [profile.release]

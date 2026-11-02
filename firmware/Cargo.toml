@@ -7,6 +7,12 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 loadcell-core = { path = "../loadcell-core" }
+loadcell-acquisition = { path = "../loadcell-acquisition" }
+loadcell-link = { path = "../loadcell-link" }
+cyw43 = { version = "=0.7.0", features = ["bluetooth"] }
+cyw43-pio = "=0.10.0"
+trouble-host = { version = "=0.6.0", default-features = false, features = ["peripheral", "gatt", "derive", "default-packet-pool-mtu-128"] }
+embassy-sync = "0.7.2"
 embassy-rp = { version = "0.10.0", features = ["rp235xa", "time-driver", "critical-section-impl", "executor-thread"] }
 embassy-executor = "0.10.0"
 embassy-futures = "0.1.2"

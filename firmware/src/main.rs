@@ -2,37 +2,61 @@
 #![no_main]
 
 mod hx711;
+mod radio;
 
 use core::fmt::Write;
 
+use cyw43_pio::{PioSpi, RM2_CLOCK_DIVIDER};
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, select};
 use embassy_rp::bind_interrupts;
 use embassy_rp::gpio::{Input, Level, Output, Pull};
-use embassy_rp::peripherals::USB;
+use embassy_rp::peripherals::{DMA_CH0, PIO0, USB};
 use embassy_rp::usb::{Driver, InterruptHandler};
+use embassy_rp::{dma, pio};
 use embassy_time::Timer;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, ControlChanged, Sender, State};
 use embassy_usb::driver::EndpointError;
-use embassy_usb::{Builder, Config, UsbDevice};
+use embassy_usb::{Builder, Config, Handler, UsbDevice};
 use heapless::String;
 use hx711::{Hx711, ReadError};
-use loadcell_core::{Calibration, NOMINAL_COUNTS_PER_KG};
+use loadcell_acquisition::session::Session;
+use loadcell_acquisition::{Buffers, acquire};
+use loadcell_link::Status;
 use panic_halt as _;
 use static_cell::StaticCell;
 
-/// Initial, **uncalibrated** sensitivities. Replace each value after measuring
-/// a known mass on each of the four sensors (signed counts / kg).
-const COUNTS_PER_KG: [i32; 4] = [NOMINAL_COUNTS_PER_KG; 4];
-const TARE_SAMPLES: usize = 12;
-
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => InterruptHandler<USB>;
+    PIO0_IRQ_0 => pio::InterruptHandler<PIO0>;
+    DMA_IRQ_0 => dma::InterruptHandler<DMA_CH0>;
 });
 
 type UsbDriver = Driver<'static, USB>;
 type Serial = Sender<'static, UsbDriver>;
 type Device = UsbDevice<'static, UsbDriver>;
+
+struct UsbLifecycle(&'static Session);
+
+impl Handler for UsbLifecycle {
+    fn reset(&mut self) {
+        self.0.reset();
+    }
+
+    fn enabled(&mut self, enabled: bool) {
+        if !enabled {
+            self.0.reset();
+        }
+    }
+
+    fn configured(&mut self, configured: bool) {
+        self.0.configured(configured);
+    }
+
+    fn suspended(&mut self, suspended: bool) {
+        self.0.suspended(suspended);
+    }
+}
 
 #[embassy_executor::task]
 async fn usb_task(mut usb: Device) -> ! {
@@ -51,91 +75,103 @@ async fn write_serial(serial: &mut Serial, message: &str) -> Result<(), Endpoint
     Ok(())
 }
 
-/// Take the mean of successful samples from each sensor. Sensors which do
-/// not respond remain `None` and do not suppress measurements from others.
-async fn tare(sensors: &mut [Hx711<'_>; 4]) -> [Option<i32>; 4] {
-    let mut sums = [0_i64; 4];
-    let mut counts = [0_u32; 4];
-    for _ in 0..TARE_SAMPLES {
-        for (i, sensor) in sensors.iter_mut().enumerate() {
-            if let Ok(value) = sensor.read().await {
-                sums[i] += i64::from(value);
-                counts[i] += 1;
+enum Sink<'a> {
+    Usb(&'a mut Serial),
+    Ble(&'a radio::Shared),
+}
+impl Sink<'_> {
+    async fn write(&mut self, message: &str) -> Result<(), EndpointError> {
+        match self {
+            Self::Usb(serial) => write_serial(serial, message).await,
+            Self::Ble(shared) => {
+                shared.write(message).await;
+                Ok(())
             }
         }
     }
-    core::array::from_fn(|i| match counts[i] {
-        0 => None,
-        n => Some((sums[i] / i64::from(n)) as i32),
-    })
 }
 
-/// Closing the terminal or resetting USB ends the current measurement session.
-/// Racing this against measurements also cancels a blocked endpoint write.
-async fn wait_disconnect(control: &ControlChanged<'_>) {
-    while control.dtr() {
-        control.control_changed().await;
-    }
+fn usb_token(
+    session: &Session,
+    control: &ControlChanged<'_>,
+) -> Option<loadcell_acquisition::session::Token> {
+    session.current().filter(|_| control.dtr())
 }
 
-/// Tare once after the terminal opens, then stream until USB reports an error.
+/// Reset the ADCs and stream validated raw words to the selected transport.
 /// Cancellation only interrupts asynchronous waits; the GPIO clock transaction
 /// in `Hx711::read` runs synchronously and always leaves PD_SCK low.
 async fn run_measurements(
-    serial: &mut Serial,
+    serial: &mut Sink<'_>,
     sensors: &mut [Hx711<'_>; 4],
+    status: &radio::Shared,
 ) -> Result<(), EndpointError> {
-    write_serial(
-        serial,
-        "Pico 2 W / HX711 x4\r\nRemove all loads; tare starts in 3 seconds.\r\n",
-    )
-    .await?;
-    Timer::after_secs(3).await;
+    status.status.set(Status::Starting);
+    // Terminate any interrupted USB line; BLE frames writes atomically.
+    serial.write("\r\nPico 2 W / HX711 x4\r\nSession started. Raw output; zero and calibration are PC-side.\r\n").await?;
+    // Keep protocol initialization and settling even though tare is removed.
+    // Each sensor resets to A/128 and waits 500 ms independently on first read.
+    for sensor in sensors.iter_mut() {
+        sensor.reset_before_next_read();
+    }
 
-    let offsets = tare(sensors).await;
-    let scales: [Option<Calibration>; 4] = core::array::from_fn(|i| {
-        offsets[i].and_then(|zero| Calibration::new(zero, COUNTS_PER_KG[i]).ok())
-    });
-    write_serial(
-        serial,
-        "Tare complete. 'kg~' is NOMINAL, not calibrated.\r\n",
+    // Session-local queues and futures are all dropped on disconnect. No old
+    // samples or worker tasks can leak into the next session.
+    let buffers = Buffers::default();
+    match select(
+        acquire(sensors, &buffers),
+        stream_measurements(serial, &buffers, status),
     )
-    .await?;
+    .await
+    {
+        Either::First(()) => unreachable!("acquisition runs until cancelled"),
+        Either::Second(result) => result,
+    }
+}
 
+/// The selected transport is the sole consumer; slow writes never suspend acquisition.
+async fn stream_measurements(
+    serial: &mut Sink<'_>,
+    buffers: &Buffers<ReadError>,
+    status: &radio::Shared,
+) -> Result<(), EndpointError> {
+    let mut receiver = buffers.receiver();
+    let mut healthy = [false; 4];
     loop {
-        for (i, sensor) in sensors.iter_mut().enumerate() {
-            let mut line: String<128> = String::new();
-            match sensor.read().await {
-                Ok(raw) => match scales[i] {
-                    Some(scale) => {
-                        write!(
-                            line,
-                            "LC{} raw={} delta={} kg~={:.3}\r\n",
-                            i + 1,
-                            raw,
-                            scale.delta(raw),
-                            scale.kilograms(raw)
-                        )
-                        .expect("line buffer capacity");
-                    }
-                    None => {
-                        write!(line, "LC{} raw={} status=no_tare\r\n", i + 1, raw)
-                            .expect("line buffer capacity");
-                    }
-                },
-                Err(error) => {
-                    let message = match error {
-                        ReadError::Timeout => "timeout",
-                        ReadError::Saturated => "saturated",
-                    };
-                    write!(line, "LC{} status={}\r\n", i + 1, message)
-                        .expect("line buffer capacity");
-                }
-            }
-            write_serial(serial, line.as_str()).await?;
+        let reading = receiver.receive().await;
+        let i = reading.index;
+        healthy[i] = reading.result.is_ok();
+        status.status.set(if healthy.iter().all(|ok| *ok) {
+            Status::Measuring
+        } else {
+            Status::Fault
+        });
+        let mut line: String<128> = String::new();
+        if reading.dropped != 0 {
+            write!(
+                line,
+                "Dropped LC{} samples={} (transport backlog)\r\n",
+                i + 1,
+                reading.dropped
+            )
+            .expect("line buffer capacity");
+            serial.write(line.as_str()).await?;
+            line.clear();
         }
-        // HX711 modules are 10 SPS. Each read waits for DOUT LOW.
-        Timer::after_millis(5).await;
+        match reading.result {
+            Ok(raw) => {
+                writeln!(line, "LC{} raw={}\r", i + 1, raw).expect("line buffer capacity");
+            }
+            Err(error) => {
+                let message = match error {
+                    ReadError::Timeout => "timeout",
+                    ReadError::Saturated => "saturated",
+                    ReadError::Protocol => "protocol",
+                };
+                write!(line, "LC{} status={}\r\n", i + 1, message).expect("line buffer capacity");
+            }
+        }
+        serial.write(line.as_str()).await?;
     }
 }
 
@@ -180,6 +216,9 @@ async fn main(spawner: Spawner) {
     static BOS_DESCRIPTOR: StaticCell<[u8; 256]> = StaticCell::new();
     static CONTROL_BUF: StaticCell<[u8; 64]> = StaticCell::new();
     static STATE: StaticCell<State> = StaticCell::new();
+    static SESSION: StaticCell<Session> = StaticCell::new();
+    static LIFECYCLE: StaticCell<UsbLifecycle> = StaticCell::new();
+    let session: &'static Session = SESSION.init(Session::default());
 
     let mut builder = Builder::new(
         driver,
@@ -191,7 +230,25 @@ async fn main(spawner: Spawner) {
     );
     let class = CdcAcmClass::new(&mut builder, STATE.init(State::new()), 64);
     let (mut serial, _receiver, control) = class.split_with_control();
+    builder.handler(LIFECYCLE.init(UsbLifecycle(session)));
     spawner.spawn(usb_task(builder.build()).expect("USB task allocation"));
+
+    static RADIO: StaticCell<radio::Shared> = StaticCell::new();
+    let radio = RADIO.init(radio::Shared::new());
+    let pwr = Output::new(p.PIN_23, Level::Low);
+    let cs = Output::new(p.PIN_25, Level::High);
+    let mut pio = pio::Pio::new(p.PIO0, Irqs);
+    let spi = PioSpi::new(
+        &mut pio.common,
+        pio.sm0,
+        RM2_CLOCK_DIVIDER,
+        pio.irq0,
+        cs,
+        p.PIN_24,
+        p.PIN_29,
+        dma::Channel::new(p.DMA_CH0, Irqs),
+    );
+    spawner.spawn(radio::start(spawner, pwr, spi, radio).expect("radio task allocation"));
 
     // Let the rails and the HX711s settle before enabling the translator.
     Timer::after_millis(100).await;
@@ -199,21 +256,46 @@ async fn main(spawner: Spawner) {
     Timer::after_millis(500).await;
 
     loop {
-        // Endpoint enablement only means enumeration, not an open terminal.
-        serial.wait_connection().await;
-        while !control.dtr() {
-            control.control_changed().await;
+        radio.select(false);
+        radio.status.set(Status::Waiting);
+        // One owner of all four sensors. Polling only connection state avoids
+        // sharing USB Signal waiters and never blocks asynchronous acquisition.
+        while usb_token(session, &control).is_none() && !radio.subscribed.get() {
+            Timer::after_millis(10).await;
         }
-        match select(
-            wait_disconnect(&control),
-            run_measurements(&mut serial, &mut sensors),
-        )
-        .await
-        {
-            Either::Second(Err(EndpointError::BufferOverflow)) => {
-                panic!("USB packet exceeds endpoint capacity");
-            }
-            Either::First(()) | Either::Second(Ok(()) | Err(EndpointError::Disabled)) => {}
+        let result = if let Some(token) = usb_token(session, &control) {
+            select(
+                async {
+                    while usb_token(session, &control) == Some(token) {
+                        Timer::after_millis(10).await;
+                    }
+                },
+                async {
+                    serial.wait_connection().await;
+                    run_measurements(&mut Sink::Usb(&mut serial), &mut sensors, radio).await
+                },
+            )
+            .await
+        } else {
+            radio.select(true);
+            let generation = radio.generation.get();
+            select(
+                async {
+                    while radio.subscribed.get()
+                        && radio.generation.get() == generation
+                        && usb_token(session, &control).is_none()
+                    {
+                        Timer::after_millis(10).await;
+                    }
+                },
+                run_measurements(&mut Sink::Ble(radio), &mut sensors, radio),
+            )
+            .await
+        };
+        if matches!(result, Either::Second(Err(EndpointError::BufferOverflow))) {
+            panic!("USB packet exceeds endpoint capacity");
         }
+        // Yield even if a disabled endpoint returned before its bus callback.
+        Timer::after_millis(10).await;
     }
 }

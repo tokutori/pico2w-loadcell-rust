@@ -1,6 +1,7 @@
 param(
     [string]$Port = 'COM5',
-    [switch]$Demo
+    [switch]$Demo,
+    [switch]$CgDemo
 )
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
@@ -10,6 +11,7 @@ $hostTarget = $hostLine.ToString().Substring(6).Trim()
 $manifest = Join-Path $PSScriptRoot 'Cargo.toml'
 $appArguments = @('--port', $Port)
 if ($Demo) { $appArguments += '--demo' }
+if ($CgDemo) { $appArguments += '--cg-demo' }
 # Explicit host target overrides the parent firmware's ARM target.
 cargo run --locked --manifest-path $manifest --target $hostTarget -p serial-plotter -- @appArguments
 exit $LASTEXITCODE
