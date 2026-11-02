@@ -1,6 +1,220 @@
 use super::*;
 use egui_plot::{PlotBounds, PlotMemory};
 
+fn window_frame(app: &mut Plotter, ctx: &egui::Context, size: egui::Vec2) -> egui::FullOutput {
+    ctx.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            ..Default::default()
+        },
+        |ctx| app.show_ui(ctx),
+    )
+}
+
+fn visible_text(output: &egui::FullOutput) -> Vec<(String, egui::Rect)> {
+    fn collect(shape: &egui::Shape, clip: egui::Rect, out: &mut Vec<(String, egui::Rect)>) {
+        match shape {
+            egui::Shape::Text(t) => {
+                let rect = t.galley.rect.translate(t.pos.to_vec2());
+                if clip.intersects(rect) {
+                    out.push((t.galley.job.text.clone(), rect));
+                }
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect(shape, clip, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut text = Vec::new();
+    for shape in &output.shapes {
+        collect(&shape.shape, shape.clip_rect, &mut text);
+    }
+    text
+}
+
+#[test]
+fn full_window_plots_fit_with_and_without_log() {
+    for size in [egui::vec2(850.0, 700.0), egui::vec2(1440.0, 1000.0)] {
+        for log_open in [false, true] {
+            for view in [View::Balance, View::Graphs] {
+                let ctx = egui::Context::default();
+                let mut app = Plotter::new(String::new(), false);
+                app.load_cg_demo();
+                app.balance.config.layout = balance::Layout::default();
+                app.log_open = log_open;
+                app.view = view;
+                for _ in 0..3 {
+                    let _ = window_frame(&mut app, &ctx, size);
+                }
+                let output = window_frame(&mut app, &ctx, size);
+                let text = visible_text(&output);
+                let bottom = text
+                    .iter()
+                    .find(|(t, _)| {
+                        t == if log_open {
+                            "Serial monitor"
+                        } else {
+                            "Serial log"
+                        }
+                    })
+                    .unwrap()
+                    .1
+                    .top()
+                    - 4.0;
+                let ids = match view {
+                    View::Balance => vec![
+                        egui::Id::new("cg-layout"),
+                        egui::Id::new(("cg-time", 0_usize)),
+                        egui::Id::new(("cg-time", 1_usize)),
+                    ],
+                    View::Graphs => (0..3_usize)
+                        .map(|i| egui::Id::new(("measurement-plot", i)))
+                        .collect(),
+                    View::Settings => unreachable!(),
+                };
+                for id in ids {
+                    let memory = PlotMemory::load(&ctx, id).unwrap();
+                    let rect = *memory.transform().frame();
+                    assert!(
+                        rect.bottom() <= bottom
+                            && rect.right() <= size.x - 4.0
+                            && rect.top() > 50.0
+                            && rect.height() > 30.0,
+                        "{size:?} log={log_open} view={view:?}: plot={rect:?}, bottom={bottom}"
+                    );
+                }
+                let axis_labels: Vec<_> = text
+                    .iter()
+                    .filter(|(t, _)| t == "PC receive time (s)" || t == "Right +x (mm)")
+                    .collect();
+                assert_eq!(
+                    axis_labels.len(),
+                    3,
+                    "Every plot must retain its x-axis label"
+                );
+                for (_, rect) in axis_labels {
+                    assert!(
+                        rect.bottom() <= bottom,
+                        "{size:?} log={log_open} view={view:?}: axis label overlaps log/footer: {rect:?}, bottom={bottom}"
+                    );
+                }
+                assert!(
+                    text.iter()
+                        .any(|(t, r)| t == "100.000" && r.height() >= 24.0)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn offline_window_has_one_disconnect_badge_and_no_stale_load() {
+    let ctx = egui::Context::default();
+    let mut app = Plotter::new(String::new(), false);
+    app.load_cg_demo();
+    app.source = Source::Offline;
+    let size = egui::vec2(850.0, 700.0);
+    for _ in 0..3 {
+        let _ = window_frame(&mut app, &ctx, size);
+    }
+    let text = visible_text(&window_frame(&mut app, &ctx, size));
+    assert_eq!(
+        text.iter()
+            .filter(|(t, _)| t.contains("Disconnected"))
+            .count(),
+        1
+    );
+    assert!(
+        !text
+            .iter()
+            .any(|(t, _)| t == "100.000" || t.contains("CG unavailable"))
+    );
+    assert_eq!(text.iter().filter(|(t, _)| t == "-- kgf").count(), 4);
+}
+
+#[test]
+fn live_fault_and_zeroing_remain_visible_without_repeating_global_state() {
+    let ctx = egui::Context::default();
+    let mut app = Plotter::new(String::new(), false);
+    app.load_cg_demo();
+    app.source = Source::Live {
+        session: Session::simulated(),
+        phase: ConnectionPhase::Ready,
+    };
+    app.started = Instant::now() - Duration::from_secs_f64(app.history.last_time);
+    app.history
+        .ingest(app.history.last_time, b"LC3 status=timeout\n");
+    let size = egui::vec2(850.0, 700.0);
+    for _ in 0..3 {
+        let _ = window_frame(&mut app, &ctx, size);
+    }
+    let text = visible_text(&window_frame(&mut app, &ctx, size));
+    assert_eq!(text.iter().filter(|(t, _)| t == "LC3: timeout").count(), 1);
+    assert_eq!(text.iter().filter(|(t, _)| t == "Connected").count(), 1);
+    assert!(text.iter().any(|(t, _)| t == "10.000 kgf"));
+    assert!(text.iter().any(|(t, _)| t == "-- kgf"));
+    app.balance.config.auto_zero_on_connect = true;
+    app.balance.begin_session();
+    let text = visible_text(&window_frame(&mut app, &ctx, size));
+    assert_eq!(
+        text.iter().filter(|(t, _)| t.contains("Zeroing:")).count(),
+        1
+    );
+    assert!(!text.iter().any(|(t, _)| t == "100.000"));
+}
+
+#[test]
+fn zero_button_clears_old_cg_before_redrawing_trace() {
+    let ctx = egui::Context::default();
+    let mut app = Plotter::new(String::new(), false);
+    app.load_cg_demo();
+    app.source = Source::Live {
+        session: Session::simulated(),
+        phase: ConnectionPhase::Ready,
+    };
+    app.started = Instant::now() - Duration::from_secs_f64(app.history.last_time);
+    let size = egui::vec2(850.0, 700.0);
+    for _ in 0..3 {
+        let _ = window_frame(&mut app, &ctx, size);
+    }
+    assert!(!app.balance.trace.points.is_empty());
+    let text = visible_text(&window_frame(&mut app, &ctx, size));
+    let pos = text
+        .iter()
+        .find(|(t, _)| t == "Zero load")
+        .unwrap()
+        .1
+        .center();
+    for pressed in [true, false] {
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                events: vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ctx| app.show_ui(ctx),
+        );
+    }
+    assert!(app.balance.trace.points.is_empty());
+    let total = app
+        .balance
+        .config
+        .total_load(&app.history, app.measurement_time())
+        .unwrap();
+    assert!(total.kgf.abs() < 1e-8);
+}
+
 #[test]
 fn opening_and_stopping_are_not_ready_and_late_ready_cannot_cancel_stop() {
     let mut app = Plotter::new(String::new(), false);
@@ -15,7 +229,7 @@ fn opening_and_stopping_are_not_ready_and_late_ready_cannot_cancel_stop() {
     assert!(!app.source.ready());
     app.handle_event(Event::Ready(transport::Link::Usb("fixture".into())));
     assert!(!app.source.ready());
-    assert_eq!(app.status, "Disconnecting...");
+    assert_eq!(app.status.text(), "Disconnecting...");
 }
 
 #[test]

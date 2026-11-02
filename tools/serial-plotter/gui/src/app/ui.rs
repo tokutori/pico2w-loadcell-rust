@@ -3,197 +3,121 @@ use super::*;
 impl Plotter {
     fn controls(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
-            ui.heading("Load cell monitor");
+            ui.strong("Load cells");
             ui.separator();
             ui.add_enabled_ui(self.source.session().is_none(), |ui| {
-                ui.selectable_value(&mut self.transport, TransportChoice::Usb, "USB serial");
+                ui.selectable_value(&mut self.transport, TransportChoice::Usb, "USB");
                 ui.selectable_value(&mut self.transport, TransportChoice::Ble, "BLE");
-                if self.transport == TransportChoice::Ble {
-                    ui.label("BLE address (optional)");
-                    ui.add(egui::TextEdit::singleline(&mut self.ble_address).desired_width(150.0))
-                        .on_hover_text("Leave empty to connect when exactly one Loadcells board is found. Connect scans for 5 seconds.");
-                } else {
-                ui.label("Port");
-                ui.add(egui::TextEdit::singleline(&mut self.port).desired_width(110.0));
-                egui::ComboBox::from_id_salt("ports")
-                    .selected_text("Available ports")
-                    .show_ui(ui, |ui| {
-                        for port in &self.ports {
-                            ui.selectable_value(&mut self.port, port.clone(), port);
-                        }
-                    });
-                if ui.button("Refresh").clicked() {
-                    self.refresh_ports();
+                if self.transport == TransportChoice::Usb {
+                    ui.add(egui::TextEdit::singleline(&mut self.port).desired_width(85.0)).on_hover_text("Serial port");
                 }
-                ui.label("Baud");
-                ui.add(egui::DragValue::new(&mut self.baud).range(1..=4_000_000));
-                }
-                if ui.button("Connect").clicked() {
-                    self.connect();
-                }
-            });
-            if ui
-                .add_enabled(self.source.session().is_some(), egui::Button::new("Disconnect"))
-                .clicked()
-            { self.disconnect(); }
-        });
-        ui.label(&self.status);
-        ui.horizontal_wrapped(|ui| {
-            ui.strong("Valid samples / last 1 s (PC received):");
-            for (i, count) in self.sample_counts().into_iter().enumerate() {
-                ui.colored_label(COLORS[i], format!("LC{}: {count}", i + 1));
-            }
-        });
-        let now = self.measurement_time();
-        self.balance.tare_controls(
-            ui,
-            &self.history,
-            now,
-            self.source.ready(),
-            self.source.is_demo(),
-        );
-        if self.history.tare != TareState::Unknown {
-            ui.horizontal_wrapped(|ui| {
-            ui.label(match self.history.tare {
-                TareState::Unknown => "Legacy firmware tare: unknown",
-                TareState::Running => "Legacy firmware tare in progress",
-                TareState::Complete => "Legacy firmware tare finished",
-            });
-            for channel in Channel::ALL {
-                if let Some(required) = self.history.tare_failures[channel.index()] {
-                    ui.colored_label(egui::Color32::YELLOW, format!("{} tare failed ({required} valid readings required); reconnect unloaded", channel.label()));
-                }
-            }
-        });
-        }
-        ui.horizontal_wrapped(|ui| {
-            if self.view == View::Graphs {
-                ui.label("Plot channels:");
-                for channel in Channel::ALL {
-                    ui.checkbox(
-                        &mut self.visible[channel.index()],
-                        egui::RichText::new(channel.label()).color(COLORS[channel.index()]),
-                    );
-                }
-                ui.separator();
-                ui.label("Window");
-                if ui
-                    .add(
-                        egui::DragValue::new(&mut self.window_seconds)
-                            .range(5.0..=3600.0)
-                            .suffix(" s"),
-                    )
-                    .changed()
-                {
-                    self.reframe_time = true;
-                }
-                let mut follow = self.paused_at.is_none();
-                if ui.checkbox(&mut follow, "Follow latest").changed() {
-                    self.paused_at = if follow { None } else { Some(self.end_time()) };
-                }
-            }
-            if ui.button("Clear history").clicked() {
-                self.history.clear();
-                self.balance.clear_history();
-            }
-            if ui
-                .add_enabled(
-                    self.source.session().is_none(),
-                    egui::Button::new("Sample log"),
-                )
-                .clicked()
-            {
-                self.load_demo();
-            }
-            if ui
-                .add_enabled(
-                    self.source.session().is_none(),
-                    egui::Button::new("CG sample"),
-                )
-                .clicked()
-            {
-                self.load_cg_demo();
-            }
-            if self.source.is_demo() && ui.button("Exit demo").clicked() {
-                self.leave_demo();
-            }
-            ui.label(format!(
-                "{} lines | {} parse/framing errors | {} firmware drops",
-                self.history.line_count,
-                self.history.errors,
-                self.history
-                    .dropped
-                    .iter()
-                    .copied()
-                    .fold(0_u64, u64::saturating_add)
-            ));
-        });
-        if self.view == View::Graphs {
-            ui.checkbox(
-                &mut self.pc_graphs,
-                "PC calibrated graphs (same zero/span as CG)",
-            );
-            ui.label(if self.pc_graphs { "Retained raw history is converted using the current PC zero/span. Nominal spans need calibration." } else { "Legacy firmware values: raw-only firmware has no delta/kg output." });
-            if self.paused_at.is_some() {
-                ui.label(
-                "Time view paused: drag / wheel to inspect retained history. Reception continues.",
-            );
-            }
-            ui.label("Auto Y fits visible data. Lower / Upper + Apply Y fixes Y limits; turn off Auto Y to drag / zoom Y.");
-            ui.horizontal_wrapped(|ui| {
-                for channel in Channel::ALL {
-                    let i = channel.index();
-                    if !self.visible[i] {
-                        continue;
-                    }
-                    let text = if self.pc_graphs {
-                        let value = |metric| {
-                            self.history.latest[i]
-                                .and_then(|r| self.balance.value(i, r.measurement, metric))
-                                .map(|v| format!("{v:.3}"))
-                                .unwrap_or_else(|| "--".into())
-                        };
-                        format!(
-                            "{} raw={} PC delta={} PC kg={}",
-                            channel.label(),
-                            value(Metric::Raw),
-                            value(Metric::Delta),
-                            value(Metric::Kg)
-                        )
+                ui.menu_button("Connection details", |ui| {
+                    ui.set_min_width(260.0);
+                    if self.transport == TransportChoice::Ble {
+                        ui.label("BLE address (optional)");
+                        ui.text_edit_singleline(&mut self.ble_address).on_hover_text("Leave empty when one Loadcells board is available. Discovery takes 5 seconds.");
                     } else {
-                        match self.history.latest[i].map(|reading| reading.measurement) {
-                            Some(Measurement::Raw { raw }) => {
-                                format!("{} raw={raw}", channel.label())
-                            }
-                            Some(Measurement::Sample { raw, delta, kg }) => {
-                                format!(
-                                    "{}  raw={raw}  delta={delta}  kg~={kg:.3}",
-                                    channel.label()
-                                )
-                            }
-                            Some(Measurement::Untared { raw }) => {
-                                format!("{}  raw={raw}  no_tare", channel.label())
-                            }
-                            Some(Measurement::Fault(Fault::Timeout)) => {
-                                format!("{}  timeout", channel.label())
-                            }
-                            Some(Measurement::Fault(Fault::Saturated)) => {
-                                format!("{}  saturated", channel.label())
-                            }
-                            Some(Measurement::Fault(Fault::Protocol)) => {
-                                format!("{}  protocol error", channel.label())
-                            }
-                            None => format!("{}  waiting for data", channel.label()),
-                        }
-                    };
-                    ui.colored_label(COLORS[i], text);
-                }
+                        egui::ComboBox::from_id_salt("ports").selected_text("Available ports").show_ui(ui, |ui| {
+                            for port in &self.ports { ui.selectable_value(&mut self.port, port.clone(), port); }
+                        });
+                        if ui.button("Refresh ports").clicked() { self.refresh_ports(); }
+                        ui.horizontal(|ui| { ui.label("Baud"); ui.add(egui::DragValue::new(&mut self.baud).range(1..=4_000_000)); });
+                    }
+                });
             });
+            if self.source.session().is_some() {
+                if ui.button("Disconnect").clicked() { self.disconnect(); }
+            } else if ui.button("Connect").clicked() { self.connect(); }
+            let (label, color) = match &self.source {
+                Source::Offline if matches!(self.status, ConnectionMessage::Error(_)) => ("Connection error", egui::Color32::LIGHT_RED),
+                Source::Offline => ("Disconnected", egui::Color32::GRAY),
+                Source::Demo { .. } => ("DEMO", egui::Color32::YELLOW),
+                Source::Live { phase: ConnectionPhase::Opening, .. } => ("Connecting...", egui::Color32::YELLOW),
+                Source::Live { phase: ConnectionPhase::Ready, .. } => ("Connected", egui::Color32::LIGHT_GREEN),
+                Source::Live { phase: ConnectionPhase::Stopping, .. } => ("Disconnecting...", egui::Color32::GRAY),
+            };
+            ui.label(egui::RichText::new(label).strong().color(color)).on_hover_text(self.status.text());
+            if self.source.is_demo() && ui.button("Exit demo").clicked() { self.leave_demo(); }
+        });
+        if let ConnectionMessage::Error(message) = &self.status {
+            ui.colored_label(egui::Color32::LIGHT_RED, message);
         }
     }
 
+    fn graph_controls(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            for channel in Channel::ALL {
+                ui.checkbox(&mut self.visible[channel.index()], egui::RichText::new(channel.label()).color(COLORS[channel.index()]))
+                    .on_hover_text("Show this channel; this does not change the supporting-sensor configuration.");
+            }
+            ui.separator();
+            ui.label("Window");
+            if ui.add(egui::DragValue::new(&mut self.window_seconds).range(5.0..=3600.0).suffix(" s")).changed() { self.reframe_time = true; }
+            let mut follow = self.paused_at.is_none();
+            if ui.checkbox(&mut follow, "Follow latest").changed() { self.paused_at = if follow { None } else { Some(self.end_time()) }; }
+            ui.checkbox(&mut self.pc_graphs, "PC calibration").on_hover_text("ON: current PC zero/span. OFF: legacy firmware delta/kg values, absent in raw-only firmware.");
+            ui.label("?").on_hover_text("Auto Y fits the visible data. Apply Y fixes the limits; turn off Auto Y to pan/zoom Y. Uncheck Follow latest to inspect older data. Reception continues.");
+        });
+    }
+
+    fn diagnostics(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.toggle_value(&mut self.log_open, "Serial log").on_hover_text("Show or hide the resizable received-text log.");
+            ui.menu_button("Actions", |ui| {
+                if ui.button("Clear measurement history").clicked() { self.history.clear(); self.balance.clear_history(); ui.close(); }
+                if ui.add_enabled(self.source.session().is_none(), egui::Button::new("Sample log")).clicked() { self.load_demo(); ui.close(); }
+                if ui.add_enabled(self.source.session().is_none(), egui::Button::new("CG sample")).clicked() { self.load_cg_demo(); ui.close(); }
+                ui.separator();
+                ui.label(format!("Legacy firmware tare: {:?}", self.history.tare));
+                for (i, required) in self.history.tare_failures.iter().enumerate() {
+                    if let Some(required) = required { ui.label(format!("LC{} tare failed ({required} samples required)", i + 1)); }
+                }
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let drops = self.history.dropped.iter().copied().fold(0_u64, u64::saturating_add);
+                let text = format!("{} lines   |   {} errors   |   {drops} drops", self.history.line_count, self.history.errors);
+                let color = if self.history.errors > 0 || drops > 0 { egui::Color32::YELLOW } else { ui.visuals().weak_text_color() };
+                ui.label(egui::RichText::new(text).small().color(color)).on_hover_text("Retained input diagnostics: received lines, parser/framing errors, firmware queue drops. These counters do not indicate physical load accuracy.");
+            });
+        });
+    }
+
+    fn log(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.strong("Serial monitor")
+                .on_hover_text("Raw received text, latest 2,000 lines.");
+            ui.checkbox(&mut self.follow_log, "Auto-scroll");
+            if ui.button("Copy log").clicked() {
+                ui.ctx().copy_text(self.history.monitor_text());
+            }
+        });
+        egui::ScrollArea::both()
+            .stick_to_bottom(self.follow_log)
+            .auto_shrink([false, false])
+            .show_rows(
+                ui,
+                ui.text_style_height(&egui::TextStyle::Monospace),
+                self.history.lines.len() + 1,
+                |ui, range| {
+                    for i in range {
+                        let text = self
+                            .history
+                            .lines
+                            .get(i)
+                            .cloned()
+                            .unwrap_or_else(|| self.history.pending());
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(text).monospace())
+                                .extend()
+                                .selectable(true),
+                        );
+                    }
+                },
+            );
+    }
+
     pub(super) fn graphs(&mut self, ui: &mut egui::Ui) {
-        let height = ((ui.available_height() - 105.0) / 3.0).max(100.0);
+        let height = ((ui.available_height() - 114.0) / 3.0).max(65.0);
         let end = self.end_time().max(1.0);
         let start = (end - self.window_seconds).max(0.0);
         let end = end.max(start + 1.0);
@@ -320,53 +244,19 @@ impl Plotter {
     }
 }
 
-impl eframe::App for Plotter {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.drain();
-        if self.source.session().is_some()
-            || (!self.source.is_demo() && self.sample_counts().iter().any(|n| *n > 0))
-        {
-            ctx.request_repaint_after(Duration::from_millis(50));
+impl Plotter {
+    /// All panels are rendered here so complete-window geometry is testable.
+    pub(super) fn show_ui(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("connection-toolbar").show(ctx, |ui| self.controls(ui));
+        egui::TopBottomPanel::bottom("diagnostics").show(ctx, |ui| self.diagnostics(ui));
+        if self.log_open {
+            egui::TopBottomPanel::bottom("monitor")
+                .resizable(true)
+                .default_height(150.0)
+                .min_height(70.0)
+                .max_height((ctx.content_rect().height() * 0.20).max(70.0))
+                .show(ctx, |ui| self.log(ui));
         }
-        egui::TopBottomPanel::top("controls").show(ctx, |ui| self.controls(ui));
-        egui::TopBottomPanel::bottom("monitor")
-            .resizable(true)
-            .default_height(140.0)
-            .min_height(90.0)
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.heading("Serial monitor");
-                    ui.checkbox(&mut self.follow_log, "Auto-scroll");
-                    if ui.button("Copy retained log").clicked() {
-                        ctx.copy_text(self.history.monitor_text());
-                    }
-                    ui.label("All channels / latest 2,000 lines");
-                    if self.source.is_demo() {
-                        ui.colored_label(egui::Color32::YELLOW, "DEMO");
-                    }
-                });
-                egui::ScrollArea::both()
-                    .stick_to_bottom(self.follow_log)
-                    .auto_shrink([false, false])
-                    .show_rows(
-                        ui,
-                        ui.text_style_height(&egui::TextStyle::Monospace),
-                        self.history.lines.len() + 1,
-                        |ui, range| {
-                            for i in range {
-                                let text = match self.history.lines.get(i) {
-                                    Some(line) => line.clone(),
-                                    None => self.history.pending(),
-                                };
-                                ui.add(
-                                    egui::Label::new(egui::RichText::new(text).monospace())
-                                        .extend()
-                                        .selectable(true),
-                                );
-                            }
-                        },
-                    );
-            });
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.view, View::Balance, "Center of gravity");
@@ -377,25 +267,28 @@ impl eframe::App for Plotter {
                     "Sensor settings / calibration",
                 );
             });
+            ui.separator();
             let now = self.measurement_time();
             match self.view {
                 View::Balance => {
-                    egui::ScrollArea::vertical()
-                        .id_salt("cg-page")
-                        .show(ui, |ui| {
-                            self.balance.show(
-                                ui,
-                                &self.history,
-                                now,
-                                self.source.ready(),
-                                self.source.is_demo(),
-                            );
-                        });
+                    self.balance.show(
+                        ui,
+                        &self.history,
+                        now,
+                        self.source.ready(),
+                        self.source.is_demo(),
+                    );
                 }
                 View::Graphs => {
-                    egui::ScrollArea::vertical()
-                        .id_salt("raw-page")
-                        .show(ui, |ui| self.graphs(ui));
+                    let _ = self.balance.summary(
+                        ui,
+                        &self.history,
+                        now,
+                        self.source.ready(),
+                        self.source.is_demo(),
+                    );
+                    self.graph_controls(ui);
+                    self.graphs(ui);
                 }
                 View::Settings => {
                     egui::ScrollArea::vertical()
@@ -412,5 +305,17 @@ impl eframe::App for Plotter {
                 }
             }
         });
+    }
+}
+
+impl eframe::App for Plotter {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.drain();
+        if self.source.session().is_some()
+            || (!self.source.is_demo() && self.sample_counts().iter().any(|n| *n > 0))
+        {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
+        self.show_ui(ctx);
     }
 }

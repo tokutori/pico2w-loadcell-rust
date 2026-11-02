@@ -6,8 +6,8 @@ use crate::{COLORS, axis, balance, history, transport};
 use balance::{trace as balance_trace, ui as balance_ui};
 use eframe::egui;
 use egui_plot::{Legend, Line, Plot, Points};
-use history::{History, TareState};
-use serial_plotter_core::{Channel, Fault, Measurement, Metric};
+use history::History;
+use serial_plotter_core::{Channel, Measurement, Metric};
 use std::time::{Duration, Instant};
 use transport::{Event, Session};
 
@@ -73,7 +73,7 @@ impl VerticalAxis {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum View {
     Balance,
     Graphs,
@@ -125,6 +125,28 @@ impl Source {
     }
 }
 
+enum ConnectionMessage {
+    Info(String),
+    Error(String),
+}
+impl ConnectionMessage {
+    fn text(&self) -> &str {
+        match self {
+            Self::Info(s) | Self::Error(s) => s,
+        }
+    }
+}
+impl From<&str> for ConnectionMessage {
+    fn from(s: &str) -> Self {
+        Self::Info(s.into())
+    }
+}
+impl From<String> for ConnectionMessage {
+    fn from(s: String) -> Self {
+        Self::Info(s)
+    }
+}
+
 pub(crate) struct Plotter {
     balance: balance_ui::Panel,
     view: View,
@@ -135,7 +157,7 @@ pub(crate) struct Plotter {
     ports: Vec<String>,
     baud: u32,
     source: Source,
-    status: String,
+    status: ConnectionMessage,
     started: Instant,
     history: History,
     visible: [bool; 4],
@@ -144,6 +166,7 @@ pub(crate) struct Plotter {
     reframe_time: bool,
     vertical_axes: [VerticalAxis; 3],
     follow_log: bool,
+    log_open: bool,
 }
 
 impl Plotter {
@@ -176,6 +199,7 @@ impl Plotter {
             reframe_time: true,
             vertical_axes: std::array::from_fn(|_| VerticalAxis::default()),
             follow_log: true,
+            log_open: false,
         };
         app.refresh_ports();
         if demo {
@@ -191,7 +215,9 @@ impl Plotter {
                 self.ports.sort();
             }
             Err(error) => {
-                self.status = format!("Cannot list ports: {error}. You can enter a port manually.")
+                self.status = ConnectionMessage::Error(format!(
+                    "Cannot list ports: {error}. You can enter a port manually."
+                ))
             }
         }
     }
@@ -202,7 +228,7 @@ impl Plotter {
         }
         if self.transport == TransportChoice::Usb && (self.port.trim().is_empty() || self.baud == 0)
         {
-            self.status = "Enter a port and a positive baud rate.".into();
+            self.status = ConnectionMessage::Error("Enter a port and a positive baud rate.".into());
             return;
         }
         let started = Instant::now();
@@ -228,10 +254,12 @@ impl Plotter {
                 self.status = if self.transport == TransportChoice::Ble {
                     "Starting BLE discovery...".into()
                 } else {
-                    format!("Opening {}...", self.port)
+                    format!("Opening {}...", self.port).into()
                 };
             }
-            Err(error) => self.status = format!("Cannot start reader: {error}"),
+            Err(error) => {
+                self.status = ConnectionMessage::Error(format!("Cannot start reader: {error}"))
+            }
         }
     }
 
@@ -242,7 +270,7 @@ impl Plotter {
                     && *phase != ConnectionPhase::Stopping
                 {
                     *phase = ConnectionPhase::Ready;
-                    self.status = link.to_string();
+                    self.status = link.to_string().into();
                 }
             }
             Event::Status(status) => {
@@ -253,7 +281,7 @@ impl Plotter {
                         ..
                     }
                 ) {
-                    self.status = status.to_string();
+                    self.status = status.to_string().into();
                 }
             }
             Event::Gap => self.history.transport_gap(),
@@ -290,7 +318,7 @@ impl Plotter {
             self.balance.end_session();
             self.status = match session.finish() {
                 Ok(()) => "Disconnected. Data retained; reconnect starts a new session.".into(),
-                Err(error) => error.to_string(),
+                Err(error) => ConnectionMessage::Error(error.to_string()),
             };
         }
     }

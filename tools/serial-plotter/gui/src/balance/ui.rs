@@ -24,6 +24,7 @@ pub struct Panel {
     auto_zero: AutoZero,
     session_revision: u64,
     bar_scale_kg: f64,
+    zero_error: Option<String>,
 }
 
 impl Default for Panel {
@@ -44,6 +45,7 @@ impl Default for Panel {
             auto_zero: AutoZero::Inactive,
             session_revision: 0,
             bar_scale_kg: 50.0,
+            zero_error: None,
         }
     }
 }
@@ -56,9 +58,11 @@ impl Panel {
 
     pub fn end_session(&mut self) {
         self.auto_zero = AutoZero::Inactive;
+        self.zero_error = None;
         self.session_revision = 0;
     }
     pub fn begin_session(&mut self) {
+        self.zero_error = None;
         self.trace = Trace::default();
         self.auto_zero = AutoZero::start(&self.config);
         self.message = if self.auto_zero.pending() {
@@ -74,6 +78,7 @@ impl Panel {
 
     pub fn capture_zero(&mut self, history: &History, now: f64) -> Result<(), balance::Error> {
         self.config.zero_all(history, now)?;
+        self.zero_error = None;
         self.auto_zero = AutoZero::Inactive;
         self.trace = Trace::default();
         self.dirty = true;
@@ -95,111 +100,125 @@ impl Panel {
         self.config.value(index, measurement, metric)
     }
 
-    /// Common USB/BLE controls; they change PC offsets and never send commands.
-    pub fn tare_controls(
+    /// Measurement readouts are shared by the CG and signal pages.
+    pub fn summary(
         &mut self,
         ui: &mut egui::Ui,
         history: &History,
         now: f64,
         connected: bool,
         demo: bool,
-    ) {
-        ui.horizontal_wrapped(|ui| {
-            ui.strong("PC zero");
-            if ui
-                .add_enabled(
-                    !demo,
-                    egui::Checkbox::new(
-                        &mut self.config.auto_zero_on_connect,
-                        "Auto zero on connection",
-                    ),
-                )
-                .changed()
-            {
-                self.dirty = true;
-                if !self.config.auto_zero_on_connect {
-                    self.auto_zero = AutoZero::Inactive;
-                    self.message = "PC auto zero off; existing zero retained.".into();
-                } else {
-                    self.message = "PC auto zero enabled for the next connection/session; use Zero PC to capture now.".into();
-                }
-            }
-            for (i, cell) in self.config.cells.iter_mut().enumerate() {
-                if ui
-                    .add_enabled(
-                        !demo,
-                        egui::Checkbox::new(&mut cell.enabled, format!("LC{}", i + 1)),
-                    )
-                    .changed()
-                {
-                    self.auto_zero.interrupt_window();
-                    self.dirty = true;
-                }
-            }
-            if ui
-                .add_enabled(
-                    connected && !demo,
-                    egui::Button::new("Zero PC (enabled sensors)"),
-                )
-                .clicked()
-                && let Err(error) = self.capture_zero(history, now)
-            {
-                self.message = error.to_string();
-            }
-        });
-        ui.label("Remove the object; leave the empty platform installed. Zero uses the recent raw average. Enable every supporting sensor.");
-        if self.zero_pending() {
-            ui.colored_label(
-                egui::Color32::YELLOW,
-                "PC auto zero pending: waiting for fresh data from all enabled sensors.",
-            );
-        }
-        ui.label(&self.message);
-        let total = if !connected && !demo {
+    ) -> Option<Balance> {
+        let active = connected || demo;
+        let cg = if !active {
+            Err(balance::Error::Disconnected)
+        } else if self.zero_pending() {
+            Err(balance::Error::ZeroPending)
+        } else {
+            self.config.calculate(history, now)
+        };
+        let total = if !active {
             Err(balance::Error::Disconnected)
         } else if self.zero_pending() {
             Err(balance::Error::ZeroPending)
         } else {
             self.config.total_load(history, now)
         };
+        ui.columns(3, |cols| {
+            metric_card(
+                &mut cols[0],
+                "TOTAL LOAD",
+                total.as_ref().ok().map(|t| format!("{:.3}", t.kgf)),
+                "kgf",
+                "All four supports, after PC zero. 1 kgf = 9.80665 N under standard gravity.",
+            );
+            metric_card(
+                &mut cols[1],
+                "CG X / RIGHT",
+                cg.as_ref().ok().map(|c| format!("{:+.1}", c.x_mm)),
+                "mm",
+                "Rightward distance from the midpoint of the front pair.",
+            );
+            metric_card(
+                &mut cols[2],
+                "CG Y / REAR",
+                cg.as_ref().ok().map(|c| format!("{:+.1}", c.y_mm)),
+                "mm",
+                "Rearward distance from the midpoint of the front pair. Height is not measured.",
+            );
+        });
+        ui.add_space(4.0);
+        let mut zero_captured = false;
         ui.horizontal_wrapped(|ui| {
-            match total {
-                Ok(total) => {
-                    ui.heading(format!("Total load (4 sensors): {:.3} kgf", total.kgf))
-                        .on_hover_text("Net load after PC zero. Sum of PC-calibrated kg-equivalent readings, expressed as kgf under standard gravity (1 kgf = 9.80665 N).");
-                    if total.nominal { ui.colored_label(egui::Color32::YELLOW, "NOMINAL: calibrate all sensors"); }
+            if ui.add_enabled(connected && !demo, egui::Button::new("Zero load"))
+                .on_hover_text("Remove the object, keep the empty platform installed and still. Capture the recent raw average for all enabled sensors.")
+                .on_disabled_hover_text("Connect to a live board to capture zero. Demo data cannot calibrate real sensors.").clicked() {
+                self.zero_error = self.capture_zero(history, now).err().map(|e| e.to_string());
+                zero_captured = self.zero_error.is_none();
+            }
+            ui.menu_button("Zero options", |ui| {
+                if ui.add_enabled(!demo, egui::Checkbox::new(&mut self.config.auto_zero_on_connect, "Auto zero on connection")).changed() {
+                    self.dirty = true;
+                    if !self.config.auto_zero_on_connect { self.auto_zero = AutoZero::Inactive; }
                 }
-                Err(error) => {
-                    ui.heading("Total load (4 sensors): -- kgf");
-                    ui.colored_label(egui::Color32::YELLOW, error.to_string());
-                }
+                ui.label("Auto zero applies at the next connection/session. Keep the empty platform still.");
+                ui.label("Choose supporting sensors in Sensor settings / calibration.");
+                ui.separator();
+                ui.label(&self.message);
+            });
+            if ui.add_enabled(cg.is_ok(), egui::Button::new("Copy values"))
+                .on_hover_text("Copy total load, CG and per-sensor loads as CSV.").clicked()
+                && let Ok(cg) = &cg {
+                let mut csv = format!("pc_receive_s,total_kg,x_right_mm,y_rear_mm,nominal,lc1_kg,lc2_kg,lc3_kg,lc4_kg\n{now:.3},{:.6},{:.3},{:.3},{}", cg.total_kg, cg.x_mm, cg.y_mm, cg.nominal);
+                for kg in cg.loads { csv.push(','); if let Some(kg) = kg { csv.push_str(&format!("{kg:.6}")); } }
+                csv.push('\n'); ui.ctx().copy_text(csv);
+            }
+            ui.menu_button("?", |ui| {
+                ui.set_max_width(340.0);
+                ui.label("Origin: midpoint of the front pair. +x right, +y rear. Coordinates are in mm; rear is drawn down.");
+                ui.label("Use a static, level platform with every supporting sensor enabled. CG height is not measured.");
+                ui.label(format!("Loads use a {:.2} s raw average. XY trail: last 1 s, older is lighter/thinner. Latest CG is red.", self.config.average_s));
+                ui.label("Bars show load. X means unavailable; a hollow circle means zero/data pending. Grey means disabled or offline. Hover a point for details.");
+            });
+            if active {
+                let nominal = total.as_ref().is_ok_and(|t| t.nominal) || cg.as_ref().is_ok_and(|c| c.nominal);
+                if let Some(error) = &self.zero_error { ui.colored_label(egui::Color32::LIGHT_RED, format!("Zero failed: {error}")); }
+                else if self.zero_pending() { ui.colored_label(egui::Color32::YELLOW, "Zeroing: keep the empty platform still"); }
+                else if let Err(error) = &total { ui.colored_label(egui::Color32::YELLOW, error.to_string()); }
+                else if let Err(error) = &cg {
+                    let label = if matches!(error, balance::Error::LowTotal { .. }) { "CG: load near zero".into() } else { format!("CG: {error}") };
+                    ui.label(label).on_hover_text(error.to_string());
+                } else if nominal { ui.colored_label(egui::Color32::YELLOW, "Uncalibrated").on_hover_text("One or more spans are nominal. Calibrate each sensor before trusting the load and CG."); }
+                else { ui.colored_label(egui::Color32::LIGHT_GREEN, "Ready"); }
+                // Calibration validity remains explicit even when CG is unavailable.
+                if nominal && cg.is_err() { ui.colored_label(egui::Color32::YELLOW, "Uncalibrated"); }
             }
         });
-        ui.horizontal_wrapped(|ui| {
-            for (i, _) in self
-                .config
-                .cells
-                .iter()
-                .enumerate()
-                .filter(|(_, c)| c.enabled)
-            {
-                let text = match balance::sensor_reading(
-                    history,
-                    &self.config,
-                    i,
-                    now,
-                    connected || demo,
-                    self.zero_pending(),
-                ) {
-                    balance::SensorReading::Load { kg, nominal } => {
-                        format!("{kg:.3} kg{}", if nominal { " (nominal)" } else { "" })
-                    }
-                    balance::SensorReading::Pending(reason) => format!("-- ({reason})"),
-                    balance::SensorReading::Unavailable(reason) => format!("-- ({reason})"),
-                };
-                ui.colored_label(COLORS[i], format!("LC{}: {text}", i + 1));
-            }
+        let counts = history.valid_samples_last_second(now);
+        egui::Frame::group(ui.style()).inner_margin(8).show(ui, |ui| {
+            ui.columns(4, |cols| {
+                for i in 0..4 {
+                    let enabled = self.config.cells[i].enabled;
+                    let color = if active && enabled { COLORS[i] } else { egui::Color32::GRAY };
+                    let reading = balance::sensor_reading(history, &self.config, i, now, active, self.zero_pending());
+                    let (value, state, hint) = match reading {
+                        balance::SensorReading::Load { kg, nominal } => (format!("{kg:.3}"), if nominal { "Nominal" } else { "" }, "Current PC calibrated average".to_owned()),
+                        balance::SensorReading::Pending(reason) => ("--".into(), "Waiting", reason.to_string()),
+                        balance::SensorReading::Unavailable(reason) => ("--".into(), if active { "No data" } else { "" }, reason.to_string()),
+                    };
+                    cols[i].horizontal(|ui| {
+                        ui.label(egui::RichText::new(format!("LC{}", i + 1)).strong().color(color));
+                        ui.label(egui::RichText::new(if !enabled { "OFF" } else { state }).small().color(if enabled && active && state == "No data" { egui::Color32::LIGHT_RED } else { color })).on_hover_text(&hint);
+                    });
+                    cols[i].label(egui::RichText::new(format!("{value} kgf")).monospace().size(18.0).color(color)).on_hover_text(hint);
+                    cols[i].weak(format!("{} samples / 1 s", counts[i])).on_hover_text("Valid samples actually received during the past 1 second, measured by the PC.");
+                }
+            });
         });
+        ui.add_space(6.0);
+        // The card values were computed before the button action. Never insert
+        // a pre-zero position into the newly cleared trace.
+        if zero_captured { None } else { cg.ok() }
     }
 
     fn check_gaps(&mut self, history: &History) {
@@ -277,28 +296,13 @@ impl Panel {
         connected: bool,
         demo: bool,
     ) {
-        ui.heading("Center of gravity (horizontal)");
-        ui.label("Origin: midpoint of front pair. +x = right, +y = rear. All positions in mm.");
-        ui.label("Static, level platform; all supporting forces must pass through the enabled sensors. Height is not measured.");
-        if demo {
-            ui.colored_label(
-                egui::Color32::YELLOW,
-                "DEMO: simulated readings; not a physical measurement.",
-            );
-        }
-        let result = if self.zero_pending() {
-            Err(balance::Error::ZeroPending)
-        } else if connected || demo {
-            self.config.calculate(history, now)
-        } else {
-            Err(balance::Error::Disconnected)
-        };
+        let result = self.summary(ui, history, now, connected, demo);
         self.check_gaps(history);
         self.trace.update(
             &self.config,
             history.measurement_revision,
             history.measurement_time,
-            result.as_ref().ok(),
+            result.as_ref(),
         );
         if !demo
             && self
@@ -310,72 +314,7 @@ impl Panel {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(50));
         }
-        match &result {
-            Ok(cg) => {
-                ui.heading(format!(
-                    "x (right): {:+.1} mm     y (rear): {:+.1} mm",
-                    cg.x_mm, cg.y_mm
-                ));
-                if cg.nominal {
-                    ui.colored_label(egui::Color32::YELLOW, "NOMINAL: one or more sensors still use an unverified span. Calibrate before trusting CG.");
-                }
-                ui.horizontal_wrapped(|ui| {
-                    for (i, kg) in cg.loads.iter().enumerate() {
-                        if let Some(kg) = kg {
-                            ui.colored_label(
-                                COLORS[i],
-                                format!(
-                                    "LC{}: {kg:.3} kg ({:.1}%)",
-                                    i + 1,
-                                    kg / cg.total_kg * 100.0
-                                ),
-                            );
-                        }
-                    }
-                });
-                if ui.button("Copy CG result (CSV)").clicked() {
-                    let mut csv = format!(
-                        "pc_receive_s,total_kg,x_right_mm,y_rear_mm,nominal,lc1_kg,lc2_kg,lc3_kg,lc4_kg\n{now:.3},{:.6},{:.3},{:.3},{}",
-                        cg.total_kg, cg.x_mm, cg.y_mm, cg.nominal
-                    );
-                    for kg in cg.loads {
-                        csv.push(',');
-                        if let Some(kg) = kg {
-                            csv.push_str(&format!("{kg:.6}"));
-                        }
-                    }
-                    csv.push('\n');
-                    ui.ctx().copy_text(csv);
-                }
-            }
-            Err(error) => {
-                ui.colored_label(egui::Color32::YELLOW, format!("CG unavailable: {error}"));
-            }
-        }
         let before = self.config.clone();
-        ui.label(format!(
-            "CG uses a {:.2} s mean of raw readings. Open Sensor settings / calibration to edit.",
-            self.config.average_s
-        ));
-        ui.horizontal_wrapped(|ui| {
-            ui.label("t-x / t-y window");
-            ui.add(
-                egui::DragValue::new(&mut self.config.trace_seconds)
-                    .range(1.0..=300.0)
-                    .suffix(" s"),
-            );
-            ui.label("XY trail: last 1 s; older = lighter and thinner");
-        });
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Load bar full height");
-            ui.add(
-                egui::DragValue::new(&mut self.bar_scale_kg)
-                    .speed(0.5)
-                    .range(0.01..=1e6)
-                    .suffix(" kg"),
-            );
-            ui.label("ON/OFF: enabled / disabled | RX: fresh data | X: unavailable | *: nominal");
-        });
         let readings = std::array::from_fn(|i| {
             balance::sensor_reading(
                 history,
@@ -386,34 +325,67 @@ impl Panel {
                 self.zero_pending(),
             )
         });
-        let height = (ui.clip_rect().bottom() - ui.cursor().min.y - 24.0).clamp(380.0, 680.0);
+        let available = ui.available_height();
         if ui.available_width() >= 780.0 {
             let gap = ui.spacing().item_spacing.x;
-            let left = (ui.available_width() * 0.34).clamp(280.0, 420.0);
+            let left = (ui.available_width() * 0.32).clamp(250.0, 400.0);
             let right = ui.available_width() - left - gap;
+            let plot_height = (available - 30.0).max(120.0);
             ui.horizontal_top(|ui| {
                 ui.allocate_ui_with_layout(
-                    egui::vec2(left, height),
+                    egui::vec2(left, available),
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
                         ui.set_width(left);
-                        self.plot(ui, result.as_ref().ok(), now, height, &readings);
+                        self.layout_controls(ui);
+                        self.plot(ui, result.as_ref(), now, plot_height, &readings);
                     },
                 );
                 ui.allocate_ui_with_layout(
-                    egui::vec2(right, height),
+                    egui::vec2(right, available),
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
                         ui.set_width(right);
-                        self.time_graphs(ui, now, (height - ui.spacing().item_spacing.y) * 0.5);
+                        self.time_controls(ui);
+                        self.time_graphs(
+                            ui,
+                            now,
+                            (plot_height - ui.spacing().item_spacing.y) * 0.5,
+                        );
                     },
                 );
             });
         } else {
-            self.plot(ui, result.as_ref().ok(), now, height, &readings);
-            self.time_graphs(ui, now, 180.0);
+            let plot_space = (available - 60.0 - ui.spacing().item_spacing.y * 2.0).max(180.0);
+            self.layout_controls(ui);
+            self.plot(ui, result.as_ref(), now, plot_space * 0.5, &readings);
+            self.time_controls(ui);
+            self.time_graphs(
+                ui,
+                now,
+                (plot_space * 0.5 - ui.spacing().item_spacing.y) * 0.5,
+            );
         }
         self.dirty |= before != self.config;
+    }
+
+    fn layout_controls(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.strong("Load map");
+            ui.label("Bar max").on_hover_text("Shared full-height load for all four bars. A + indicates a value beyond this scale.");
+            ui.add(egui::DragValue::new(&mut self.bar_scale_kg).speed(0.5).range(0.01..=1e6).suffix(" kgf"));
+        });
+    }
+    fn time_controls(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.strong("CG history");
+            ui.label("Window");
+            ui.add(
+                egui::DragValue::new(&mut self.config.trace_seconds)
+                    .range(1.0..=300.0)
+                    .suffix(" s"),
+            );
+        });
     }
 
     pub fn show_settings(
@@ -425,12 +397,12 @@ impl Panel {
         demo: bool,
     ) {
         ui.heading("Sensor settings / calibration");
-        ui.label("Sensor positions, channel assignment, zero offsets and signed sensitivity are configured here.");
+        ui.label("?").on_hover_text("Sensor positions, channel assignment, zero offsets and signed sensitivity are configured here.");
         let before = self.config.clone();
         ui.group(|ui| {
             ui.heading("1. Measurement point coordinates (mm)");
-            ui.label("Upper = front; lower = rear. +x = right, +y = rear. Use the front-pair midpoint as your fixed reference origin.");
-            ui.label("Coordinates belong to the measurement points; changing them does not reassign sensors.");
+            ui.label("Coordinates in mm").on_hover_text("Upper = front; lower = rear. +x = right, +y = rear. Keep the front-pair midpoint as the reference origin. Editing coordinates does not reassign sensors.");
+
             if ui.button("Apply 600 x 2000 mm frame").clicked() {
                 self.config.layout.points = balance::Layout::default().points;
                 self.message = "600 x 2000 mm coordinates applied; sensor assignments and calibration retained.".into();
@@ -448,7 +420,7 @@ impl Panel {
         });
         ui.group(|ui| {
             ui.heading("2. Point to sensor assignment");
-            ui.label("Choose which LC measures each point. Selecting an assigned LC swaps the two sensors; point coordinates stay fixed.");
+            ui.label("?").on_hover_text("Selecting an assigned LC swaps the two sensors. Point coordinates stay fixed.");
             egui::Grid::new("point-sensors").striped(true).show(ui, |ui| {
                 ui.strong("Measurement point"); ui.strong("Physical sensor"); ui.end_row();
                 for (role, name) in balance::POINT_NAMES.into_iter().enumerate() {
@@ -618,7 +590,11 @@ impl Panel {
                         continue;
                     }
                     let pos = balance::plot_position(x, y);
-                    let color = if self.config.cells[i].enabled {
+                    let color = if self.config.cells[i].enabled
+                        && !matches!(
+                            readings[i],
+                            balance::SensorReading::Unavailable(balance::DataIssue::Disconnected)
+                        ) {
                         COLORS[i]
                     } else {
                         egui::Color32::GRAY
@@ -660,7 +636,11 @@ impl Panel {
             }
             let base = point + egui::vec2(if x >= center_x { 18.0 } else { -18.0 }, 0.0);
             let enabled = self.config.cells[i].enabled;
-            let color = if enabled {
+            let offline = matches!(
+                readings[i],
+                balance::SensorReading::Unavailable(balance::DataIssue::Disconnected)
+            );
+            let color = if enabled && !offline {
                 COLORS[i]
             } else {
                 egui::Color32::GRAY
@@ -668,7 +648,7 @@ impl Panel {
             let state = readings[i];
             let status = match state {
                 balance::SensorReading::Unavailable(reason) => {
-                    let cross_color = if enabled {
+                    let cross_color = if enabled && !offline {
                         egui::Color32::LIGHT_RED
                     } else {
                         color
@@ -741,27 +721,41 @@ impl Panel {
                         }
                     }
                     format!(
-                        "RX: {kg:.2} kg{}{}",
+                        "RX: {kg:.2} kgf{}{}",
                         if nominal { "*" } else { "" },
                         if kg < 0.0 { " !" } else { "" }
                     )
                 }
             };
-            let text_color = if enabled && matches!(state, balance::SensorReading::Unavailable(_)) {
-                egui::Color32::LIGHT_RED
-            } else {
-                color
-            };
+            let text_color =
+                if enabled && !offline && matches!(state, balance::SensorReading::Unavailable(_)) {
+                    egui::Color32::LIGHT_RED
+                } else {
+                    color
+                };
             let label = painter.layout_no_wrap(
                 format!(
-                    "{}: LC{} {}\n{status}",
+                    "{}: LC{}{}",
                     balance::POINT_TAGS[role],
                     i + 1,
-                    if enabled { "ON" } else { "OFF" }
+                    if enabled { "" } else { " OFF" }
                 ),
                 egui::FontId::proportional(11.0),
                 text_color,
             );
+            if response.response.hover_pos().is_some_and(|pointer| {
+                egui::Rect::from_min_max(
+                    point - egui::vec2(32.0, full_height + 12.0),
+                    point + egui::vec2(32.0, 35.0),
+                )
+                .contains(pointer)
+            }) {
+                response.response.clone().on_hover_text(format!(
+                    "{} / LC{}: {status}",
+                    balance::POINT_TAGS[role],
+                    i + 1
+                ));
+            }
             let frame = response.transform.frame();
             let label_x = if x >= center_x {
                 point.x + 8.0
@@ -809,6 +803,27 @@ impl Panel {
                 });
         }
     }
+}
+
+fn metric_card(ui: &mut egui::Ui, title: &str, value: Option<String>, unit: &str, hint: &str) {
+    egui::Frame::group(ui.style())
+        .fill(ui.visuals().faint_bg_color)
+        .inner_margin(10)
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(egui::RichText::new(title).small().weak());
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(value.unwrap_or_else(|| "--".into()))
+                        .size(28.0)
+                        .monospace()
+                        .strong(),
+                );
+                ui.label(egui::RichText::new(unit).weak());
+            });
+        })
+        .response
+        .on_hover_text(hint);
 }
 
 #[cfg(test)]
@@ -880,9 +895,9 @@ mod tests {
                     (bars[0].rect.height() - transform.frame().height() * 0.18 * 10.0 / 50.0).abs()
                         < 0.1
                 );
-                assert!(labels.contains(&"UR: LC3 ON\nRX: zero needed"));
-                assert!(labels.contains(&"UL: LC2 OFF\nRX: 25.00 kg"));
-                assert!(labels.contains(&"LL: LC4 ON\nX: timeout"));
+                assert!(labels.contains(&"UR: LC3"));
+                assert!(labels.contains(&"UL: LC2 OFF"));
+                assert!(labels.contains(&"LL: LC4"));
             }
         }
     }
