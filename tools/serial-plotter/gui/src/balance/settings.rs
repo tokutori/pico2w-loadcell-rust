@@ -1,11 +1,41 @@
 //! Versioned UTF-8 settings, isolated from calculation and UI.
 use crate::balance::Config;
 use std::{
-    fs,
+    fmt, fs,
     io::Write,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
+
+#[derive(Debug)]
+pub enum Error {
+    Read(std::io::Error),
+    Json(serde_json::Error),
+    Validation(super::Error),
+    Write(std::io::Error),
+    Clock(std::time::SystemTimeError),
+}
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read(e) => write!(f, "Cannot read settings: {e}"),
+            Self::Json(e) => write!(f, "Invalid settings JSON: {e}"),
+            Self::Validation(e) => write!(f, "{e}"),
+            Self::Write(e) => write!(f, "Cannot save settings: {e}"),
+            Self::Clock(e) => write!(f, "Cannot generate settings temporary filename: {e}"),
+        }
+    }
+}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Read(e) | Self::Write(e) => Some(e),
+            Self::Json(e) => Some(e),
+            Self::Validation(e) => Some(e),
+            Self::Clock(e) => Some(e),
+        }
+    }
+}
 
 pub fn default_path() -> PathBuf {
     let base = std::env::var_os("LOCALAPPDATA")
@@ -16,25 +46,24 @@ pub fn default_path() -> PathBuf {
     base.join("LoadCellSerialPlotter").join("balance.json")
 }
 
-pub fn load(path: &Path) -> Result<Config, String> {
-    let text = fs::read_to_string(path).map_err(|e| format!("Cannot read settings: {e}"))?;
-    let config: Config =
-        serde_json::from_str(&text).map_err(|e| format!("Invalid settings JSON: {e}"))?;
-    config.validate()?;
+pub fn load(path: &Path) -> Result<Config, Error> {
+    let text = fs::read_to_string(path).map_err(Error::Read)?;
+    let config: Config = serde_json::from_str(&text).map_err(Error::Json)?;
+    config.validate().map_err(Error::Validation)?;
     Ok(config)
 }
 
-pub fn save(path: &Path, config: &Config) -> Result<(), String> {
-    config.validate()?;
-    let json = serde_json::to_vec_pretty(config).map_err(|e| e.to_string())?;
+pub fn save(path: &Path, config: &Config) -> Result<(), Error> {
+    config.validate().map_err(Error::Validation)?;
+    let json = serde_json::to_vec_pretty(config).map_err(Error::Json)?;
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    fs::create_dir_all(parent).map_err(Error::Write)?;
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|e| e.to_string())?
+        .map_err(Error::Clock)?
         .as_nanos();
     let temp = parent.join(format!(".balance-{}-{stamp}.tmp", std::process::id()));
     let result = (|| {
@@ -51,7 +80,7 @@ pub fn save(path: &Path, config: &Config) -> Result<(), String> {
     if result.is_err() {
         let _ = fs::remove_file(&temp);
     }
-    result.map_err(|e| format!("Cannot save settings: {e}"))
+    result.map_err(Error::Write)
 }
 
 #[cfg(test)]

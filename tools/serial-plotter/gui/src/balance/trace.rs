@@ -1,5 +1,5 @@
 //! Derived PC CG history. Never bridges an invalid interval or a settings change.
-use crate::balance::{Balance, Config};
+use crate::balance::{Balance, CalculationKey, Config};
 use std::collections::VecDeque;
 
 #[derive(Clone, Copy, Debug)]
@@ -13,7 +13,7 @@ pub struct Point {
 #[derive(Default)]
 pub struct Trace {
     pub points: VecDeque<Point>,
-    config: Option<Config>,
+    config: Option<CalculationKey>,
     revision: Option<u64>,
     last_time: f64,
     gap: bool,
@@ -24,8 +24,7 @@ impl Trace {
         self.gap = true;
     }
     pub fn update(&mut self, config: &Config, revision: u64, now: f64, value: Option<&Balance>) {
-        let mut calculation_config = config.clone();
-        calculation_config.trace_seconds = 0.0; // view changes preserve history
+        let calculation_config = config.calculation_key();
         if self.config.as_ref() != Some(&calculation_config)
             || self.revision.is_some_and(|r| revision < r)
             || now < self.last_time

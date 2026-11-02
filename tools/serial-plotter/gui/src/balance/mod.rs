@@ -1,8 +1,17 @@
 //! PC-only calibration and static horizontal center of gravity.
 //! X is rightward, Y is rearward, in mm from the midpoint of the front pair.
+pub mod error;
+pub use error::{DataIssue, Error, WaitReason};
+pub mod settings;
+#[cfg(test)]
+mod tests;
+pub mod trace;
+pub mod ui;
+mod zero;
+
 use crate::history::{History, TareState, valid_raw};
 use serde::{Deserialize, Serialize};
-use serial_plotter_core::{Measurement, Metric};
+use serial_plotter_core::{Channel, Measurement, Metric};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -11,6 +20,16 @@ pub struct CellConfig {
     pub zero_raw: Option<f64>,
     pub counts_per_kg: f64,
     pub calibrated: bool,
+}
+
+impl CellConfig {
+    fn valid(&self) -> bool {
+        self.counts_per_kg.is_finite()
+            && (1e-6..=1e12).contains(&self.counts_per_kg.abs())
+            && self
+                .zero_raw
+                .is_none_or(|z| z.is_finite() && (-8_388_608.0..=8_388_607.0).contains(&z))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -41,7 +60,45 @@ pub struct Layout {
     /// Upper-right, upper-left, lower-right, lower-left. +x right, +y rear.
     pub points: [[f64; 2]; 4],
     /// Named point -> zero-based physical LC index.
-    pub channels: [usize; 4],
+    pub channels: Assignment,
+}
+
+/// A bijection: the four physical channels occur exactly once. JSON is checked
+/// at this boundary, so rendering can never index with an invalid assignment.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "[usize; 4]", into = "[usize; 4]")]
+pub struct Assignment([usize; 4]);
+impl Default for Assignment {
+    fn default() -> Self {
+        Self([0, 1, 2, 3])
+    }
+}
+impl TryFrom<[usize; 4]> for Assignment {
+    type Error = Error;
+    fn try_from(value: [usize; 4]) -> Result<Self, Error> {
+        let mut sorted = value;
+        sorted.sort_unstable();
+        if sorted != [0, 1, 2, 3] {
+            return Err(Error::Assignment);
+        }
+        Ok(Self(value))
+    }
+}
+impl From<Assignment> for [usize; 4] {
+    fn from(value: Assignment) -> Self {
+        value.0
+    }
+}
+impl std::ops::Index<usize> for Assignment {
+    type Output = usize;
+    fn index(&self, point: usize) -> &usize {
+        &self.0[point]
+    }
+}
+impl Assignment {
+    pub fn iter(&self) -> std::slice::Iter<'_, usize> {
+        self.0.iter()
+    }
 }
 
 pub const POINT_NAMES: [&str; 4] = [
@@ -58,7 +115,7 @@ pub const POINT_TAGS: [&str; 4] = ["UR", "UL", "LR", "LL"];
 #[serde(deny_unknown_fields)]
 struct StoredLayout {
     points: Option<[[f64; 2]; 4]>,
-    channels: [usize; 4],
+    channels: Assignment,
     x1: Option<f64>,
     x2: Option<f64>,
     y: Option<f64>,
@@ -67,8 +124,8 @@ struct StoredLayout {
 }
 
 impl TryFrom<StoredLayout> for Layout {
-    type Error = String;
-    fn try_from(s: StoredLayout) -> Result<Self, String> {
+    type Error = Error;
+    fn try_from(s: StoredLayout) -> Result<Self, Error> {
         match (s.points, s.x1, s.x2, s.y, s.dx, s.dy) {
             (Some(points), None, None, None, None, None) => Ok(Self {
                 points,
@@ -87,9 +144,7 @@ impl TryFrom<StoredLayout> for Layout {
                     channels: s.channels,
                 })
             }
-            _ => Err(
-                "Layout requires points + channels, or a complete legacy dimension layout".into(),
-            ),
+            _ => Err(Error::LayoutFormat),
         }
     }
 }
@@ -103,7 +158,7 @@ impl Default for Layout {
                 [300.0, 2000.0],
                 [-300.0, 2000.0],
             ],
-            channels: [0, 1, 2, 3],
+            channels: Assignment::default(),
         }
     }
 }
@@ -111,14 +166,17 @@ impl Default for Layout {
 impl Layout {
     /// Assign a physical sensor to a point, swapping the previous assignment.
     /// Coordinates and per-sensor calibration are never modified.
-    pub fn assign(&mut self, point: usize, channel: usize) -> Result<(), String> {
-        let mut sorted = self.channels;
-        sorted.sort_unstable();
-        if point >= 4 || channel >= 4 || sorted != [0, 1, 2, 3] {
-            return Err("Invalid point/channel assignment".into());
+    pub fn assign(&mut self, point: usize, channel: usize) -> Result<(), Error> {
+        if point >= 4 || channel >= 4 {
+            return Err(Error::Assignment);
         }
-        let other = self.channels.iter().position(|c| *c == channel).unwrap();
-        self.channels.swap(point, other);
+        let other = self
+            .channels
+            .0
+            .iter()
+            .position(|c| *c == channel)
+            .ok_or(Error::Assignment)?;
+        self.channels.0.swap(point, other);
         Ok(())
     }
 
@@ -126,9 +184,7 @@ impl Layout {
     pub fn positions(&self) -> [[f64; 2]; 4] {
         let mut positions = [[0.0; 2]; 4];
         for (role, channel) in self.channels.iter().copied().enumerate() {
-            if channel < 4 {
-                positions[channel] = self.points[role];
-            }
+            positions[channel] = self.points[role];
         }
         positions
     }
@@ -157,7 +213,33 @@ impl Default for Config {
     }
 }
 
+/// Only inputs that alter CG results belong in its history identity.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CalculationKey {
+    layout: Layout,
+    cells: [CellConfig; 4],
+    average_s: f64,
+    min_samples: usize,
+    max_age_s: f64,
+    max_skew_s: f64,
+    min_total_kg: f64,
+    negative_tolerance_kg: f64,
+}
+
 impl Config {
+    pub fn calculation_key(&self) -> CalculationKey {
+        CalculationKey {
+            layout: self.layout.clone(),
+            cells: self.cells.clone(),
+            average_s: self.average_s,
+            min_samples: self.min_samples,
+            max_age_s: self.max_age_s,
+            max_skew_s: self.max_skew_s,
+            min_total_kg: self.min_total_kg,
+            negative_tolerance_kg: self.negative_tolerance_kg,
+        }
+    }
+
     /// Derive plotted values from raw using the same signed calibration as CG.
     pub fn value(&self, index: usize, measurement: Measurement, metric: Metric) -> Option<f64> {
         let raw = valid_raw(measurement)?;
@@ -165,6 +247,9 @@ impl Config {
             return Some(raw);
         }
         let cell = &self.cells[index];
+        if !cell.valid() {
+            return None;
+        }
         let delta = raw - cell.zero_raw?;
         let value = match metric {
             Metric::Raw => raw,
@@ -174,14 +259,9 @@ impl Config {
         value.is_finite().then_some(value)
     }
     /// Validate persisted numeric settings without requiring completed setup.
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), Error> {
         if self.version != 1 {
-            return Err("Unsupported settings version".into());
-        }
-        let mut channels = self.layout.channels;
-        channels.sort_unstable();
-        if channels != [0, 1, 2, 3] {
-            return Err("Assign each LC exactly once to the four support positions".into());
+            return Err(Error::Version(self.version));
         }
         if self
             .layout
@@ -190,25 +270,15 @@ impl Config {
             .flatten()
             .any(|v| !v.is_finite() || v.abs() > 1e6)
         {
-            return Err(
-                "Measurement point coordinates must be finite and within +/- 1000000 mm".into(),
-            );
+            return Err(Error::Coordinates);
         }
         for (i, c) in self.cells.iter().enumerate() {
-            if !c.counts_per_kg.is_finite()
-                || c.counts_per_kg.abs() < 1e-6
-                || c.counts_per_kg.abs() > 1e12
-                || c.zero_raw
-                    .is_some_and(|z| !z.is_finite() || !(-8_388_608.0..=8_388_607.0).contains(&z))
-            {
-                return Err(format!(
-                    "LC{}: invalid position, zero or signed counts/kg",
-                    i + 1
-                ));
+            if !c.valid() {
+                return Err(Error::Calibration(Channel::ALL[i]));
             }
         }
         if !self.trace_seconds.is_finite() || !(1.0..=300.0).contains(&self.trace_seconds) {
-            return Err("CG time graph window must be 1 to 300 seconds".into());
+            return Err(Error::TraceWindow);
         }
         if !self.average_s.is_finite()
             || !(0.05..=10.0).contains(&self.average_s)
@@ -222,12 +292,12 @@ impl Config {
             || !self.negative_tolerance_kg.is_finite()
             || !(0.0..=100.0).contains(&self.negative_tolerance_kg)
         {
-            return Err("Invalid averaging, freshness or load limits".into());
+            return Err(Error::Limits);
         }
         Ok(())
     }
 
-    fn geometry(&self) -> Result<(), String> {
+    fn geometry(&self) -> Result<(), Error> {
         let positions = self.layout.positions();
         let points: Vec<_> = self
             .cells
@@ -237,7 +307,7 @@ impl Config {
             .map(|(i, _)| positions[i])
             .collect();
         if points.len() < 3 {
-            return Err("Enable at least 3 non-collinear supports for 2D CG".into());
+            return Err(Error::TooFewSupports);
         }
         for a in 0..points.len() {
             for b in a + 1..points.len() {
@@ -250,10 +320,10 @@ impl Config {
                 }
             }
         }
-        Err("Enter measured support positions: supports must not lie on one line".into())
+        Err(Error::Collinear)
     }
 
-    pub fn zero_all(&mut self, history: &History, now: f64) -> Result<(), String> {
+    pub fn zero_all(&mut self, history: &History, now: f64) -> Result<(), Error> {
         self.validate()?;
         let means = self.means(history, now)?;
         for (cell, mean) in self.cells.iter_mut().zip(means) {
@@ -264,16 +334,16 @@ impl Config {
         Ok(())
     }
 
-    pub fn calibrate(&mut self, index: usize, mean: Mean, mass: f64) -> Result<(), String> {
+    pub fn calibrate(&mut self, index: usize, mean: Mean, mass: f64) -> Result<(), Error> {
         let zero = self.cells[index]
             .zero_raw
-            .ok_or("Capture this sensor's zero first")?;
+            .ok_or(Error::ZeroMissing(Channel::ALL[index]))?;
         if !mass.is_finite() || mass <= 0.0 || mass > 1e6 {
-            return Err("Known mass must be positive and finite".into());
+            return Err(Error::KnownMass);
         }
         let delta = mean.raw - zero;
         if !delta.is_finite() || delta.abs() < 1.0 {
-            return Err("Load change is less than 1 ADC count; check load and zero".into());
+            return Err(Error::LoadChange);
         }
         let mut candidate = self.clone();
         candidate.cells[index].counts_per_kg = delta / mass;
@@ -283,7 +353,7 @@ impl Config {
         Ok(())
     }
 
-    pub fn means(&self, history: &History, now: f64) -> Result<[Option<Mean>; 4], String> {
+    pub fn means(&self, history: &History, now: f64) -> Result<[Option<Mean>; 4], Error> {
         let mut means = [None; 4];
         for (i, cell) in self.cells.iter().enumerate() {
             if cell.enabled {
@@ -292,55 +362,89 @@ impl Config {
         }
         let times: Vec<_> = means.iter().flatten().map(|m| m.latest).collect();
         if times.is_empty() {
-            return Err("Enable the sensors supporting the object".into());
+            return Err(Error::NoEnabledSensors);
         }
         let oldest = times.iter().copied().fold(f64::INFINITY, f64::min);
         let newest = times.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         if newest - oldest > self.max_skew_s {
-            return Err(
-                "Sensor reception times are too far apart; waiting for aligned data".into(),
-            );
+            return Err(Error::TimeSkew);
         }
         Ok(means)
     }
 
-    pub fn calculate(&self, history: &History, now: f64) -> Result<Balance, String> {
+    /// Sum all four calibrated supports independently of CG geometry or its
+    /// minimum-load threshold. A missing/disabled support is never treated as zero.
+    /// Calibration is mass-equivalent; kgf uses the standard-gravity convention.
+    pub fn total_load(&self, history: &History, now: f64) -> Result<TotalLoad, Error> {
+        for (i, cell) in self.cells.iter().enumerate() {
+            if !cell.enabled {
+                return Err(Error::DisabledSensor(Channel::ALL[i]));
+            }
+        }
+        let loads = self.load_summary(history, now)?;
+        Ok(TotalLoad {
+            kgf: loads.total,
+            nominal: loads.nominal,
+        })
+    }
+
+    fn load_summary(&self, history: &History, now: f64) -> Result<Loads, Error> {
         self.validate()?;
-        self.geometry()?;
         let means = self.means(history, now)?;
         let mut loads = [None; 4];
-        let positions = self.layout.positions();
-        let (mut total, mut mx, mut my) = (0.0, 0.0, 0.0);
+        let mut total = 0.0;
         let mut nominal = false;
         for (i, cell) in self.cells.iter().enumerate() {
             if let Some(mean) = means[i] {
-                let zero = cell
-                    .zero_raw
-                    .ok_or_else(|| format!("LC{}: capture platform-only zero first", i + 1))?;
+                let zero = cell.zero_raw.ok_or(Error::ZeroMissing(Channel::ALL[i]))?;
                 let kg = (mean.raw - zero) / cell.counts_per_kg;
                 if kg < -self.negative_tolerance_kg {
-                    return Err(format!(
-                        "LC{}: negative load {kg:.3} kg; check polarity, zero and support contact",
-                        i + 1
-                    ));
+                    return Err(Error::NegativeLoad {
+                        channel: Channel::ALL[i],
+                        kg,
+                    });
                 }
                 // Small negative readings are retained, never clipped to zero.
                 loads[i] = Some(kg);
                 total += kg;
-                mx += kg * positions[i][0];
-                my += kg * positions[i][1];
                 nominal |= !cell.calibrated;
             }
         }
+        if !total.is_finite() {
+            return Err(Error::Overflow);
+        }
+        Ok(Loads {
+            total,
+            loads,
+            nominal,
+        })
+    }
+
+    pub fn calculate(&self, history: &History, now: f64) -> Result<Balance, Error> {
+        self.validate()?;
+        self.geometry()?;
+        let Loads {
+            total,
+            loads,
+            nominal,
+        } = self.load_summary(history, now)?;
+        let positions = self.layout.positions();
+        let (mut mx, mut my) = (0.0, 0.0);
+        for (kg, [x, y]) in loads.iter().zip(positions) {
+            if let Some(kg) = kg {
+                mx += kg * x;
+                my += kg * y;
+            }
+        }
         if total < self.min_total_kg {
-            return Err(format!(
-                "Total load {total:.3} kg is below the {:.3} kg limit",
-                self.min_total_kg
-            ));
+            return Err(Error::LowTotal {
+                kg: total,
+                minimum: self.min_total_kg,
+            });
         }
         let (x_mm, y_mm) = (mx / total, my / total);
         if !total.is_finite() || !x_mm.is_finite() || !y_mm.is_finite() {
-            return Err("Calculation overflow; check calibration".into());
+            return Err(Error::Overflow);
         }
         Ok(Balance {
             total_kg: total,
@@ -350,6 +454,18 @@ impl Config {
             nominal,
         })
     }
+}
+
+struct Loads {
+    total: f64,
+    loads: [Option<f64>; 4],
+    nominal: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TotalLoad {
+    pub kgf: f64,
+    pub nominal: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -363,9 +479,32 @@ pub struct Mean {
 /// Reception is inferred from fresh valid ADC data, not electrical continuity.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SensorReading {
-    Unavailable(&'static str),
-    Pending(&'static str),
+    Unavailable(DataIssue),
+    Pending(WaitReason),
     Load { kg: f64, nominal: bool },
+}
+
+fn available(history: &History, config: &Config, index: usize, now: f64) -> Result<(), DataIssue> {
+    if history.tare == TareState::Running {
+        return Err(DataIssue::FirmwareTare);
+    }
+    if history.has_pending_gap(index) {
+        return Err(DataIssue::Gap);
+    }
+    let last = history.samples[index]
+        .back()
+        .filter(|_| history.latest[index].is_some())
+        .ok_or(DataIssue::NoData)?;
+    if !now.is_finite() || now < last.seconds || now - last.seconds > config.max_age_s {
+        return Err(DataIssue::Stale);
+    }
+    if let Measurement::Fault(fault) = last.measurement {
+        return Err(DataIssue::Fault(fault));
+    }
+    if valid_raw(last.measurement).is_none() {
+        return Err(DataIssue::InvalidRaw);
+    }
+    Ok(())
 }
 
 pub fn sensor_reading(
@@ -378,40 +517,24 @@ pub fn sensor_reading(
 ) -> SensorReading {
     use SensorReading::{Load, Pending, Unavailable};
     if !connected {
-        return Unavailable("disconnected");
+        return Unavailable(DataIssue::Disconnected);
     }
-    let Some(last) = history.samples[index].back() else {
-        return Unavailable("no data");
-    };
-    if !now.is_finite() || now < last.seconds || now - last.seconds > config.max_age_s {
-        return Unavailable("stale");
-    }
-    if let Measurement::Fault(fault) = last.measurement {
-        return Unavailable(match fault {
-            serial_plotter_core::Fault::Timeout => "timeout",
-            serial_plotter_core::Fault::Saturated => "saturated",
-            serial_plotter_core::Fault::Protocol => "protocol error",
-        });
-    }
-    if valid_raw(last.measurement).is_none() {
-        return Unavailable("invalid raw");
-    }
-    if history.has_pending_gap(index) || history.latest[index].is_none() {
-        return Unavailable("data gap");
+    if let Err(issue) = available(history, config, index, now) {
+        return Unavailable(issue);
     }
     if config.validate().is_err() {
-        return Pending("RX: check settings");
+        return Pending(WaitReason::Settings);
     }
-    if zero_pending || config.cells[index].zero_raw.is_none() {
-        return Pending("RX: zero needed");
-    }
+    let Some(zero) = config.cells[index].zero_raw.filter(|_| !zero_pending) else {
+        return Pending(WaitReason::Zero);
+    };
     let Ok(mean) = mean(history, config, index, now) else {
-        return Pending("RX: averaging");
+        return Pending(WaitReason::Averaging);
     };
     let cell = &config.cells[index];
-    let kg = (mean.raw - cell.zero_raw.unwrap()) / cell.counts_per_kg;
+    let kg = (mean.raw - zero) / cell.counts_per_kg;
     if !kg.is_finite() {
-        return Pending("RX: check span");
+        return Pending(WaitReason::Settings);
     }
     Load {
         kg,
@@ -419,24 +542,20 @@ pub fn sensor_reading(
     }
 }
 
-/// Uses only the latest contiguous healthy window, including valid no_tare raw.
+/// Uses only the latest contiguous healthy window. Silence longer than the
+/// freshness limit also starts a new window, even without a firmware fault.
 /// PC reception times cannot establish simultaneous ADC sampling.
-pub fn mean(history: &History, config: &Config, index: usize, now: f64) -> Result<Mean, String> {
-    let error = |why: &str| format!("LC{}: {why}", index + 1);
-    if history.tare == TareState::Running || history.latest[index].is_none() {
-        return Err(error("waiting for readings after firmware tare"));
-    }
-    if history.has_pending_gap(index) {
-        return Err(error("waiting for readings after a data gap"));
-    }
+pub fn mean(history: &History, config: &Config, index: usize, now: f64) -> Result<Mean, Error> {
+    let error = |issue| Error::Reading {
+        channel: Channel::ALL[index],
+        issue,
+    };
+    available(history, config, index, now).map_err(error)?;
     let samples = &history.samples[index];
-    let last = samples.back().ok_or_else(|| error("no readings"))?;
-    if !now.is_finite() || now < last.seconds || now - last.seconds > config.max_age_s {
-        return Err(error("stale data; waiting for a fresh reading"));
-    }
-    let (mut sum, mut count) = (0.0, 0);
+    let last = samples.back().ok_or_else(|| error(DataIssue::NoData))?;
+    let (mut sum, mut count, mut newer) = (0.0, 0, last.seconds);
     for sample in samples.iter().rev() {
-        if sample.seconds < now - config.average_s {
+        if sample.seconds < now - config.average_s || newer - sample.seconds > config.max_age_s {
             break;
         }
         let Some(raw) = valid_raw(sample.measurement) else {
@@ -444,17 +563,13 @@ pub fn mean(history: &History, config: &Config, index: usize, now: f64) -> Resul
         };
         sum += raw;
         count += 1;
+        newer = sample.seconds;
         if sample.break_before {
             break;
         }
     }
     if count < config.min_samples {
-        let why = if matches!(last.measurement, Measurement::Fault(_)) {
-            "sensor fault"
-        } else {
-            "not enough fresh, uninterrupted samples"
-        };
-        return Err(error(why));
+        return Err(error(DataIssue::InsufficientSamples));
     }
     Ok(Mean {
         raw: sum / count as f64,

@@ -1,4 +1,8 @@
 //! Serial I/O boundary. A bounded queue transfers bytes to the GUI thread.
+mod ble;
+mod error;
+pub use error::Error;
+
 use std::{
     io::{self, Read},
     sync::{
@@ -10,9 +14,38 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Link {
+    Usb(String),
+    Ble(String),
+}
+impl std::fmt::Display for Link {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Usb(port) => write!(f, "Connected to {port} | DTR on | PC zero/calibration"),
+            Self::Ble(address) => write!(
+                f,
+                "BLE {address} subscribed | USB takes priority | PC zero/calibration"
+            ),
+        }
+    }
+}
+#[derive(Clone, Debug)]
+pub enum Progress {
+    Scanning,
+    Connecting(String),
+}
+impl std::fmt::Display for Progress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Scanning => f.write_str("Scanning BLE for 5 s..."),
+            Self::Connecting(address) => write!(f, "Connecting BLE {address}..."),
+        }
+    }
+}
 pub enum Event {
-    Opened,
-    Status(String),
+    Ready(Link),
+    Status(Progress),
     Gap,
     Bytes { at: Instant, bytes: Vec<u8> },
 }
@@ -20,10 +53,29 @@ pub enum Event {
 pub struct Session {
     pub events: Receiver<Event>,
     stop: Arc<AtomicBool>,
-    worker: JoinHandle<Result<(), String>>,
+    worker: JoinHandle<Result<(), Error>>,
 }
 
 impl Session {
+    #[cfg(test)]
+    pub fn simulated() -> Self {
+        let (sender, events) = mpsc::sync_channel(64);
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let worker = thread::spawn(move || {
+            let _sender = sender;
+            while !worker_stop.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Ok(())
+        });
+        Self {
+            events,
+            stop,
+            worker,
+        }
+    }
+
     pub fn start_ble(address: String) -> io::Result<Self> {
         let (sender, events) = mpsc::sync_channel(64);
         let stop = Arc::new(AtomicBool::new(false));
@@ -34,8 +86,8 @@ impl Session {
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
-                    .map_err(|e| e.to_string())?;
-                rt.block_on(crate::ble::run(&address, &worker_stop, &sender))
+                    .map_err(Error::Runtime)?;
+                rt.block_on(ble::run(&address, &worker_stop, &sender))
             })?;
         Ok(Self {
             events,
@@ -64,14 +116,12 @@ impl Session {
         self.worker.is_finished()
     }
 
-    pub fn finish(self) -> Result<(), String> {
-        self.worker
-            .join()
-            .map_err(|_| "Serial reader thread panicked".to_owned())?
+    pub fn finish(self) -> Result<(), Error> {
+        self.worker.join().map_err(|_| Error::WorkerPanic)?
     }
 }
 
-fn send(sender: &SyncSender<Event>, mut event: Event, stop: &AtomicBool) -> Result<(), String> {
+fn send(sender: &SyncSender<Event>, mut event: Event, stop: &AtomicBool) -> Result<(), Error> {
     loop {
         if stop.load(Ordering::Relaxed) {
             return Ok(());
@@ -85,7 +135,7 @@ fn send(sender: &SyncSender<Event>, mut event: Event, stop: &AtomicBool) -> Resu
                 event = returned;
                 thread::sleep(Duration::from_millis(2));
             }
-            Err(mpsc::TrySendError::Disconnected(_)) => return Err("Monitor closed".into()),
+            Err(mpsc::TrySendError::Disconnected(_)) => return Err(Error::MonitorClosed),
         }
     }
 }
@@ -96,7 +146,7 @@ fn read_stream(
     port: &mut impl Read,
     stop: &AtomicBool,
     sender: &SyncSender<Event>,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     let mut bytes = [0_u8; 4096];
     let mut pending = Vec::with_capacity(4096);
     let mut last_received = Instant::now();
@@ -137,9 +187,7 @@ fn read_stream(
                         stop,
                     )?;
                 }
-                return Err(format!(
-                    "Serial read failed: {error}. Check USB and reconnect."
-                ));
+                return Err(Error::Read(error));
             }
         };
         if flush && !pending.is_empty() {
@@ -162,18 +210,18 @@ fn read_port(
     baud: u32,
     stop: &AtomicBool,
     sender: &SyncSender<Event>,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     let mut port = serialport::new(name, baud)
         .timeout(Duration::from_millis(10))
         .flow_control(serialport::FlowControl::None)
         .open()
-        .map_err(|error| {
-            format!("Cannot open {name}: {error}. Close other serial monitors, then reconnect.")
+        .map_err(|source| Error::SerialOpen {
+            port: name.into(),
+            source,
         })?;
     let result = (|| {
-        port.write_data_terminal_ready(true)
-            .map_err(|error| format!("Cannot enable DTR: {error}"))?;
-        send(sender, Event::Opened, stop)?;
+        port.write_data_terminal_ready(true).map_err(Error::Dtr)?;
+        send(sender, Event::Ready(Link::Usb(name.into())), stop)?;
         read_stream(&mut port, stop, sender)
     })();
     let _ = port.write_data_terminal_ready(false);
@@ -234,11 +282,7 @@ mod tests {
             }
         }
         assert!(
-            worker
-                .join()
-                .unwrap()
-                .unwrap_err()
-                .contains("synthetic EOF")
+            matches!(worker.join().unwrap(), Err(Error::Read(e)) if e.kind() == io::ErrorKind::UnexpectedEof)
         );
         assert_eq!(history.line_count, (count * 4) as u64);
         assert_eq!(history.errors, 0);
@@ -276,9 +320,7 @@ mod tests {
         let (sender, receiver) = mpsc::sync_channel(64);
         let stop = AtomicBool::new(false);
         assert!(
-            read_stream(&mut Burst { left: 500 }, &stop, &sender)
-                .unwrap_err()
-                .contains("end of fixture")
+            matches!(read_stream(&mut Burst { left: 500 }, &stop, &sender), Err(Error::Read(e)) if e.kind() == io::ErrorKind::BrokenPipe)
         );
         let mut events = 0;
         let mut received = Vec::new();
@@ -299,7 +341,7 @@ mod tests {
     #[test]
     fn full_queue_waits_for_capacity_instead_of_disconnecting() {
         let (sender, receiver) = mpsc::sync_channel(1);
-        sender.send(Event::Opened).unwrap();
+        sender.send(Event::Gap).unwrap();
         let worker = thread::spawn(move || {
             send(
                 &sender,
@@ -312,7 +354,7 @@ mod tests {
         });
         thread::sleep(Duration::from_millis(10));
         assert!(!worker.is_finished());
-        assert!(matches!(receiver.recv().unwrap(), Event::Opened));
+        assert!(matches!(receiver.recv().unwrap(), Event::Gap));
         assert!(worker.join().unwrap().is_ok());
         match receiver.recv().unwrap() {
             Event::Bytes { bytes, .. } => assert_eq!(bytes, b"retained"),
@@ -323,10 +365,10 @@ mod tests {
     #[test]
     fn stop_cancels_a_send_waiting_on_a_full_queue() {
         let (sender, _receiver) = mpsc::sync_channel(1);
-        sender.send(Event::Opened).unwrap();
+        sender.send(Event::Gap).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = stop.clone();
-        let worker = thread::spawn(move || send(&sender, Event::Opened, &worker_stop));
+        let worker = thread::spawn(move || send(&sender, Event::Gap, &worker_stop));
         stop.store(true, Ordering::Relaxed);
         assert!(worker.join().unwrap().is_ok());
     }

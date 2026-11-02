@@ -1,5 +1,5 @@
 //! BLE central. Discovery, setup and notification I/O stay off the UI thread.
-use crate::transport::Event;
+use super::{Error, Event, Link, Progress, error::Operation};
 use btleplug::{
     api::{Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter},
     platform::{Manager, Peripheral},
@@ -29,42 +29,46 @@ async fn send(sender: &SyncSender<Event>, mut event: Event) -> Result<()> {
                 event = returned;
                 sleep(Duration::from_millis(2)).await;
             }
-            Err(TrySendError::Disconnected(_)) => return Err("Monitor closed".into()),
+            Err(TrySendError::Disconnected(_)) => return Err(Error::MonitorClosed),
         }
     }
 }
 
-type Result<T> = std::result::Result<T, String>;
-async fn bounded<T>(future: impl std::future::Future<Output = btleplug::Result<T>>) -> Result<T> {
+type Result<T> = std::result::Result<T, Error>;
+async fn bounded<T>(
+    operation: Operation,
+    future: impl std::future::Future<Output = btleplug::Result<T>>,
+) -> Result<T> {
     timeout(Duration::from_secs(10), future)
         .await
-        .map_err(|_| "BLE operation timed out".to_owned())?
-        .map_err(|e| e.to_string())
+        .map_err(|_| Error::Timeout(operation))?
+        .map_err(|source| Error::Ble { operation, source })
 }
 
 pub async fn run(address: &str, stop: &AtomicBool, sender: &SyncSender<Event>) -> Result<()> {
     let setup = async {
-        let manager = bounded(Manager::new()).await?;
-        let adapters = bounded(manager.adapters()).await?;
+        let manager = bounded(Operation::Manager, Manager::new()).await?;
+        let adapters = bounded(Operation::Adapters, manager.adapters()).await?;
         // Windows normally provides one OS Bluetooth radio. Report absence.
-        adapters
-            .into_iter()
-            .next()
-            .ok_or_else(|| "No Bluetooth adapter. Enable Bluetooth in Windows.".to_owned())
+        adapters.into_iter().next().ok_or(Error::NoAdapter)
     };
     let adapter = tokio::select! { _ = stopped(stop) => return Ok(()), value = setup => value? };
     let mut selected: Option<Peripheral> = None;
     let work = async {
-        send(sender, Event::Status("Scanning BLE for 5 s...".into())).await?;
-        bounded(adapter.start_scan(ScanFilter {
-            services: vec![Uuid::from_u128(loadcell_link::SERVICE)],
-        }))
+        send(sender, Event::Status(Progress::Scanning)).await?;
+        bounded(
+            Operation::Scan,
+            adapter.start_scan(ScanFilter {
+                services: vec![Uuid::from_u128(loadcell_link::SERVICE)],
+            }),
+        )
         .await?;
         sleep(Duration::from_secs(5)).await;
-        let peripherals = bounded(adapter.peripherals()).await?;
+        let peripherals = bounded(Operation::Devices, adapter.peripherals()).await?;
         let mut matches = Vec::new();
         for peripheral in peripherals {
-            if let Some(properties) = bounded(peripheral.properties()).await?
+            if let Some(properties) =
+                bounded(Operation::Properties, peripheral.properties()).await?
                 && properties
                     .services
                     .contains(&Uuid::from_u128(loadcell_link::SERVICE))
@@ -77,32 +81,25 @@ pub async fn run(address: &str, stop: &AtomicBool, sender: &SyncSender<Event>) -
                 matches.push(peripheral);
             }
         }
-        bounded(adapter.stop_scan()).await?;
+        bounded(Operation::StopScan, adapter.stop_scan()).await?;
         if matches.len() != 1 {
             return Err(if matches.is_empty() {
-                "No matching Pico Loadcells found. Check power, firmware and Bluetooth.".into()
+                Error::NoBoard
             } else {
-                format!(
-                    "Multiple boards found. Enter BLE address: {}",
-                    matches
-                        .iter()
-                        .map(|p| p.address().to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
+                Error::MultipleBoards(matches.iter().map(|p| p.address().to_string()).collect())
             });
         }
         let peripheral = matches.remove(0);
         selected = Some(peripheral.clone()); // Always clean up even if setup is cancelled.
         send(
             sender,
-            Event::Status(format!("Connecting BLE {}...", peripheral.address())),
+            Event::Status(Progress::Connecting(peripheral.address().to_string())),
         )
         .await?;
         // Listen before connecting so a disconnect during setup is not lost.
-        let mut events = bounded(adapter.events()).await?;
-        bounded(peripheral.connect()).await?;
-        bounded(peripheral.discover_services()).await?;
+        let mut events = bounded(Operation::Events, adapter.events()).await?;
+        bounded(Operation::Connect, peripheral.connect()).await?;
+        bounded(Operation::DiscoverServices, peripheral.discover_services()).await?;
         let characteristic = peripheral
             .characteristics()
             .into_iter()
@@ -110,27 +107,25 @@ pub async fn run(address: &str, stop: &AtomicBool, sender: &SyncSender<Event>) -
                 c.uuid == Uuid::from_u128(loadcell_link::TX)
                     && c.service_uuid == Uuid::from_u128(loadcell_link::SERVICE)
             })
-            .ok_or_else(|| "Board does not provide Loadcells BLE protocol v1".to_owned())?;
-        let mut notifications = bounded(peripheral.notifications()).await?;
-        bounded(peripheral.subscribe(&characteristic)).await?;
+            .ok_or(Error::MissingService)?;
+        let mut notifications =
+            bounded(Operation::Notifications, peripheral.notifications()).await?;
+        bounded(Operation::Subscribe, peripheral.subscribe(&characteristic)).await?;
         send(
             sender,
-            Event::Status(format!(
-                "BLE {} subscribed | USB takes priority | PC zero/calibration",
-                peripheral.address()
-            )),
+            Event::Ready(Link::Ble(peripheral.address().to_string())),
         )
         .await?;
         let mut decoder = loadcell_link::Decoder::default();
         loop {
             tokio::select! {
                 event = events.next() => match event {
-                    Some(CentralEvent::DeviceDisconnected(id)) if id == peripheral.id() => return Err("BLE disconnected. Reconnect to start a new session.".into()),
-                    None => return Err("Bluetooth adapter event stream closed".into()),
+                    Some(CentralEvent::DeviceDisconnected(id)) if id == peripheral.id() => return Err(Error::Disconnected),
+                    None => return Err(Error::AdapterClosed),
                     _ => {}
                 },
                 notification = notifications.next() => {
-                    let n = notification.ok_or_else(|| "BLE notification stream closed".to_owned())?;
+                    let n = notification.ok_or(Error::NotificationsClosed)?;
                     if n.uuid != characteristic.uuid { continue; }
                     let at = Instant::now();
                     let (gap, message) = decoder.push(&n.value);
@@ -236,7 +231,7 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             let (sender, _receiver) = std::sync::mpsc::sync_channel(1);
-            sender.send(Event::Opened).unwrap();
+            sender.send(Event::Gap).unwrap();
             let stop = AtomicBool::new(false);
             let result = timeout(Duration::from_secs(1), async {
                 tokio::select! {

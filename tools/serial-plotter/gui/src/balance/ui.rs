@@ -1,8 +1,11 @@
+use super::zero::AutoZero;
 use crate::{
     COLORS,
     balance::{self, Balance, Config},
-    balance_settings,
-    balance_trace::{Trace, trail_style},
+    balance::{
+        settings as balance_settings,
+        trace::{Trace, trail_style},
+    },
     history::History,
 };
 use eframe::egui;
@@ -18,8 +21,7 @@ pub struct Panel {
     known_mass: f64,
     pub trace: Trace,
     discontinuities: [u64; 4],
-    auto_pending: bool,
-    auto_since: Option<f64>,
+    auto_zero: AutoZero,
     session_revision: u64,
     bar_scale_kg: f64,
 }
@@ -39,8 +41,7 @@ impl Default for Panel {
             known_mass: 1.0,
             trace: Trace::default(),
             discontinuities: [0; 4],
-            auto_pending: false,
-            auto_since: None,
+            auto_zero: AutoZero::Inactive,
             session_revision: 0,
             bar_scale_kg: 50.0,
         }
@@ -48,16 +49,19 @@ impl Default for Panel {
 }
 
 impl Panel {
+    pub fn clear_history(&mut self) {
+        self.trace = Trace::default();
+        self.auto_zero.interrupt_window();
+    }
+
     pub fn end_session(&mut self) {
-        self.auto_pending = false;
-        self.auto_since = None;
+        self.auto_zero = AutoZero::Inactive;
         self.session_revision = 0;
     }
     pub fn begin_session(&mut self) {
         self.trace = Trace::default();
-        self.auto_pending = self.config.auto_zero_on_connect;
-        self.auto_since = None;
-        self.message = if self.auto_pending {
+        self.auto_zero = AutoZero::start(&self.config);
+        self.message = if self.auto_zero.pending() {
             "PC auto zero: remove the object; keep the empty platform still.".into()
         } else {
             "PC auto zero off: using saved zero; capture again if needed.".into()
@@ -65,13 +69,12 @@ impl Panel {
     }
 
     pub fn zero_pending(&self) -> bool {
-        self.auto_pending && self.config.auto_zero_on_connect
+        self.auto_zero.pending() && self.config.auto_zero_on_connect
     }
 
-    pub fn capture_zero(&mut self, history: &History, now: f64) -> Result<(), String> {
+    pub fn capture_zero(&mut self, history: &History, now: f64) -> Result<(), balance::Error> {
         self.config.zero_all(history, now)?;
-        self.auto_pending = false;
-        self.auto_since = None;
+        self.auto_zero = AutoZero::Inactive;
         self.trace = Trace::default();
         self.dirty = true;
         self.message =
@@ -115,8 +118,7 @@ impl Panel {
             {
                 self.dirty = true;
                 if !self.config.auto_zero_on_connect {
-                    self.auto_pending = false;
-                    self.auto_since = None;
+                    self.auto_zero = AutoZero::Inactive;
                     self.message = "PC auto zero off; existing zero retained.".into();
                 } else {
                     self.message = "PC auto zero enabled for the next connection/session; use Zero PC to capture now.".into();
@@ -130,7 +132,7 @@ impl Panel {
                     )
                     .changed()
                 {
-                    self.auto_since = None;
+                    self.auto_zero.interrupt_window();
                     self.dirty = true;
                 }
             }
@@ -142,7 +144,7 @@ impl Panel {
                 .clicked()
                 && let Err(error) = self.capture_zero(history, now)
             {
-                self.message = error;
+                self.message = error.to_string();
             }
         });
         ui.label("Remove the object; leave the empty platform installed. Zero uses the recent raw average. Enable every supporting sensor.");
@@ -153,30 +155,47 @@ impl Panel {
             );
         }
         ui.label(&self.message);
+        let total = if !connected && !demo {
+            Err(balance::Error::Disconnected)
+        } else if self.zero_pending() {
+            Err(balance::Error::ZeroPending)
+        } else {
+            self.config.total_load(history, now)
+        };
         ui.horizontal_wrapped(|ui| {
-            for (i, cell) in self
+            match total {
+                Ok(total) => {
+                    ui.heading(format!("Total load (4 sensors): {:.3} kgf", total.kgf))
+                        .on_hover_text("Net load after PC zero. Sum of PC-calibrated kg-equivalent readings, expressed as kgf under standard gravity (1 kgf = 9.80665 N).");
+                    if total.nominal { ui.colored_label(egui::Color32::YELLOW, "NOMINAL: calibrate all sensors"); }
+                }
+                Err(error) => {
+                    ui.heading("Total load (4 sensors): -- kgf");
+                    ui.colored_label(egui::Color32::YELLOW, error.to_string());
+                }
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            for (i, _) in self
                 .config
                 .cells
                 .iter()
                 .enumerate()
                 .filter(|(_, c)| c.enabled)
             {
-                let kg = self
-                    .config
-                    .validate()
-                    .ok()
-                    .and_then(|()| balance::mean(history, &self.config, i, now).ok())
-                    .and_then(|m| cell.zero_raw.map(|z| (m.raw - z) / cell.counts_per_kg));
-                let text = if !connected || self.zero_pending() {
-                    "--".into()
-                } else {
-                    kg.map(|kg| {
-                        format!(
-                            "{kg:.3} kg{}",
-                            if cell.calibrated { "" } else { " (nominal)" }
-                        )
-                    })
-                    .unwrap_or_else(|| "-- (zero/data needed)".into())
+                let text = match balance::sensor_reading(
+                    history,
+                    &self.config,
+                    i,
+                    now,
+                    connected || demo,
+                    self.zero_pending(),
+                ) {
+                    balance::SensorReading::Load { kg, nominal } => {
+                        format!("{kg:.3} kg{}", if nominal { " (nominal)" } else { "" })
+                    }
+                    balance::SensorReading::Pending(reason) => format!("-- ({reason})"),
+                    balance::SensorReading::Unavailable(reason) => format!("-- ({reason})"),
                 };
                 ui.colored_label(COLORS[i], format!("LC{}: {text}", i + 1));
             }
@@ -187,7 +206,7 @@ impl Panel {
         for (i, cell) in self.config.cells.iter().enumerate() {
             if cell.enabled && self.discontinuities[i] != history.discontinuities[i] {
                 self.trace.break_line();
-                self.auto_since = None;
+                self.auto_zero.interrupt_window();
             }
         }
         self.discontinuities = history.discontinuities;
@@ -199,35 +218,31 @@ impl Panel {
             self.begin_session();
         }
         self.check_gaps(history);
-        if self.zero_pending() {
-            match self
+        if self.auto_zero.pending() {
+            let ready = self
                 .config
                 .validate()
-                .and_then(|()| self.config.means(history, now))
+                .and_then(|()| self.config.means(history, now));
+            let capture = self.auto_zero.observe(&self.config, now, ready.is_ok());
+            if capture {
+                if let Err(error) = self.capture_zero(history, now) {
+                    self.message = error.to_string();
+                }
+            } else if self.zero_pending()
+                && let Err(error) = ready
             {
-                Ok(_) => {
-                    let since = *self.auto_since.get_or_insert(now);
-                    if now - since >= self.config.average_s
-                        && let Err(error) = self.capture_zero(history, now)
-                    {
-                        self.message = error;
-                    }
-                }
-                Err(error) => {
-                    self.auto_since = None;
-                    self.message = format!("PC auto zero waiting: {error}");
-                }
+                self.message = format!("PC auto zero waiting: {error}");
             }
         }
         let value = if self.zero_pending() {
-            Err("PC zero pending".into())
+            Err(balance::Error::ZeroPending)
         } else {
             self.config.calculate(history, now)
         };
         self.trace.update(
             &self.config,
-            history.line_count,
-            history.last_time,
+            history.measurement_revision,
+            history.measurement_time,
             value.as_ref().ok(),
         );
     }
@@ -242,11 +257,15 @@ impl Panel {
         match balance_settings::load(Path::new(&self.path)) {
             Ok(config) => {
                 self.config = config;
+                // Explicitly loading a saved zero ends any in-progress capture.
+                // Auto-zero preference applies again at the next session.
+                self.auto_zero = AutoZero::Inactive;
+                self.trace = Trace::default();
                 self.dirty = false;
                 self.message =
                     "Settings loaded. Verify the platform-only zero before measuring.".into();
             }
-            Err(error) => self.message = error,
+            Err(error) => self.message = error.to_string(),
         }
     }
 
@@ -268,17 +287,17 @@ impl Panel {
             );
         }
         let result = if self.zero_pending() {
-            Err("PC zero pending: keep the empty platform still".into())
+            Err(balance::Error::ZeroPending)
         } else if connected || demo {
             self.config.calculate(history, now)
         } else {
-            Err("Disconnected: no live CG. Connect to receive fresh readings.".into())
+            Err(balance::Error::Disconnected)
         };
         self.check_gaps(history);
         self.trace.update(
             &self.config,
-            history.line_count,
-            history.last_time,
+            history.measurement_revision,
+            history.measurement_time,
             result.as_ref().ok(),
         );
         if !demo
@@ -294,8 +313,8 @@ impl Panel {
         match &result {
             Ok(cg) => {
                 ui.heading(format!(
-                    "x (right): {:+.1} mm     y (rear): {:+.1} mm     Total: {:.3} kg",
-                    cg.x_mm, cg.y_mm, cg.total_kg
+                    "x (right): {:+.1} mm     y (rear): {:+.1} mm",
+                    cg.x_mm, cg.y_mm
                 ));
                 if cg.nominal {
                     ui.colored_label(egui::Color32::YELLOW, "NOMINAL: one or more sensors still use an unverified span. Calibrate before trusting CG.");
@@ -442,7 +461,7 @@ impl Panel {
                         let previous = self.config.layout.channels[role];
                         self.message = match self.config.layout.assign(role, selected) {
                             Ok(()) => format!("Swapped LC{} and LC{}. Coordinates and per-sensor zero/span retained.", previous + 1, selected + 1),
-                            Err(error) => error,
+                            Err(error) => error.to_string(),
                         };
                     }
                     ui.end_row();
@@ -454,7 +473,7 @@ impl Panel {
             ui.label("Zero with the empty platform installed; remove only the object. Wait for stable readings over the averaging window before capture.");
             ui.add_enabled_ui(connected && !demo, |ui| {
                 if ui.button("Capture platform-only zero (all enabled sensors)").clicked()
-                    && let Err(error) = self.capture_zero(history, now) { self.message = error; }
+                    && let Err(error) = self.capture_zero(history, now) { self.message = error.to_string(); }
             });
             let positions = self.config.layout.positions();
             let validation = self.config.validate();
@@ -469,7 +488,7 @@ impl Panel {
                         ui.checkbox(&mut c.enabled, format!("LC{}", i + 1));
                         ui.label(format!("({:.1}, {:.1})", positions[i][0], positions[i][1]));
                         ui.label(match &means[i] { Ok(m) => format!("{:.1} / {}", m.raw, m.count), Err(_) => "--".into() })
-                            .on_hover_text(means[i].as_ref().err().map(String::as_str).unwrap_or("Mean of the current healthy raw window"));
+                            .on_hover_text(means[i].as_ref().err().map(ToString::to_string).unwrap_or_else(|| "Mean of the current healthy raw window".into()));
                         let mut zero = c.zero_raw.unwrap_or(0.0);
                         ui.vertical(|ui| {
                             if ui.add(egui::DragValue::new(&mut zero).speed(1.0)).changed() { c.zero_raw = Some(zero); }
@@ -480,8 +499,7 @@ impl Panel {
                         ui.checkbox(&mut c.calibrated, "Verified").on_hover_text("Check after entering a known calibrated signed sensitivity; nominal defaults are not verified.");
                         if ui.add_enabled(connected && !demo && means[i].is_ok(), egui::Button::new("Zero")).clicked() {
                             c.zero_raw = means[i].as_ref().ok().map(|m| m.raw);
-                            self.auto_pending = false;
-                            self.auto_since = None;
+                            self.auto_zero = AutoZero::Inactive;
                             self.message = format!("LC{} zero captured", i + 1);
                         }
                         ui.end_row();
@@ -496,7 +514,7 @@ impl Panel {
                 ui.add(egui::DragValue::new(&mut self.known_mass).speed(0.1).suffix(" kg"));
                 if ui.add_enabled(connected && !demo, egui::Button::new("Capture span (auto polarity)")).clicked() {
                     self.message = match means[self.calibration_channel].clone().and_then(|m| self.config.calibrate(self.calibration_channel, m, self.known_mass)) {
-                        Ok(()) => "Signed sensitivity captured. Repeat for each sensor, then zero the assembled empty platform.".into(), Err(e) => e,
+                        Ok(()) => "Signed sensitivity captured. Repeat for each sensor, then zero the assembled empty platform.".into(), Err(e) => e.to_string(),
                     };
                 }
             });
@@ -515,7 +533,7 @@ impl Panel {
         });
         self.dirty |= before != self.config;
         if let Err(error) = self.config.validate() {
-            ui.colored_label(egui::Color32::LIGHT_RED, error);
+            ui.colored_label(egui::Color32::LIGHT_RED, error.to_string());
         }
         ui.separator();
         ui.horizontal_wrapped(|ui| {
@@ -530,7 +548,7 @@ impl Panel {
                         self.dirty = false;
                         "Settings saved.".into()
                     }
-                    Err(e) => e,
+                    Err(e) => e.to_string(),
                 };
             }
             if ui
@@ -637,6 +655,9 @@ impl Panel {
             let point = response
                 .transform
                 .position_from_point(&PlotPoint::new(x, -y));
+            if !response.transform.frame().contains(point) {
+                continue;
+            }
             let base = point + egui::vec2(if x >= center_x { 18.0 } else { -18.0 }, 0.0);
             let enabled = self.config.cells[i].enabled;
             let color = if enabled {
@@ -665,7 +686,7 @@ impl Panel {
                 }
                 balance::SensorReading::Pending(reason) => {
                     painter.circle_stroke(base, 5.0, (1.5, color));
-                    reason.into()
+                    reason.to_string()
                 }
                 balance::SensorReading::Load { kg, nominal } => {
                     if enabled {
@@ -808,8 +829,10 @@ mod tests {
                 kg: 25.0,
                 nominal: false,
             },
-            balance::SensorReading::Pending("RX: zero needed"),
-            balance::SensorReading::Unavailable("timeout"),
+            balance::SensorReading::Pending(balance::WaitReason::Zero),
+            balance::SensorReading::Unavailable(balance::DataIssue::Fault(
+                serial_plotter_core::Fault::Timeout,
+            )),
         ];
         for width in [280.0, 420.0] {
             let ctx = egui::Context::default();

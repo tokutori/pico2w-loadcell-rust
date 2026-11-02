@@ -1,4 +1,171 @@
-use crate::{balance::*, history::History};
+use crate::{balance, balance::*, history::History};
+
+#[test]
+fn four_sensor_total_works_at_zero_and_without_valid_cg_geometry() {
+    let mut config = configured();
+    close(
+        config.total_load(&readings([1, 2, 3, 4]), 1.2).unwrap().kgf,
+        10.0,
+    );
+    assert!(!config.total_load(&readings([1; 4]), 1.2).unwrap().nominal);
+    config.layout.points = [[0.0, 0.0]; 4];
+    assert!(config.calculate(&readings([1; 4]), 1.2).is_err());
+    close(config.total_load(&readings([1; 4]), 1.2).unwrap().kgf, 4.0);
+    close(config.total_load(&readings([0; 4]), 1.2).unwrap().kgf, 0.0);
+    config.cells[0].zero_raw = Some(-100010.0);
+    close(
+        config.total_load(&readings([0; 4]), 1.2).unwrap().kgf,
+        -0.01,
+    );
+    config.cells[0].calibrated = false;
+    assert!(config.total_load(&readings([1; 4]), 1.2).unwrap().nominal);
+}
+
+#[test]
+fn four_sensor_total_never_substitutes_zero_for_missing_or_disabled_supports() {
+    let mut config = configured();
+    let healthy = readings([1; 4]);
+    assert!(config.total_load(&healthy, 2.0).is_err());
+    for index in 0..4 {
+        let mut history = readings([1; 4]);
+        history.ingest(1.2, format!("LC{} status=timeout\n", index + 1).as_bytes());
+        assert!(matches!(
+            config.total_load(&history, 1.2),
+            Err(Error::Reading {
+                issue: DataIssue::Fault(_),
+                ..
+            })
+        ));
+        config.cells[index].enabled = false;
+        assert!(matches!(
+            config.total_load(&healthy, 1.2),
+            Err(Error::DisabledSensor(_))
+        ));
+        config.cells[index].enabled = true;
+    }
+    config.cells[2].zero_raw = None;
+    assert!(matches!(
+        config.total_load(&healthy, 1.2),
+        Err(Error::ZeroMissing(_))
+    ));
+}
+
+#[test]
+fn corrupt_lines_invalidate_averages_and_start_new_plot_segments() {
+    let config = configured();
+    let mut overlong = vec![b'x'; 4097];
+    overlong.push(b'\n');
+    for bytes in [
+        b"LC1 malformed\n".to_vec(),
+        b"Dropped LC1 samples=bad (transport backlog)\n".to_vec(),
+        vec![0xff, b'\n'],
+        overlong,
+    ] {
+        let mut history = readings([1; 4]);
+        history.ingest(1.21, &bytes);
+        assert!(matches!(
+            mean(&history, &config, 0, 1.21),
+            Err(Error::Reading {
+                issue: DataIssue::Gap,
+                ..
+            })
+        ));
+        for (n, time) in [1.22, 1.23, 1.24].into_iter().enumerate() {
+            raw_frame(&mut history, time, [-102000, -98000, -98000, -98000]);
+            if n < 2 {
+                assert!(config.calculate(&history, time).is_err());
+            }
+        }
+        close(mean(&history, &config, 0, 1.24).unwrap().raw, -102000.0);
+        assert_eq!(
+            history
+                .segments(
+                    serial_plotter_core::Channel::Lc1,
+                    serial_plotter_core::Metric::Raw,
+                    0.0,
+                    2.0
+                )
+                .len(),
+            2
+        );
+    }
+}
+
+#[test]
+fn silent_intervals_do_not_contaminate_the_recovered_average() {
+    let mut config = configured();
+    config.average_s = 5.0;
+    let mut history = readings([1; 4]);
+    raw_frame(&mut history, 3.0, [-102000, -98000, -98000, -98000]);
+    assert!(matches!(
+        mean(&history, &config, 0, 3.0),
+        Err(Error::Reading {
+            issue: DataIssue::InsufficientSamples,
+            ..
+        })
+    ));
+    raw_frame(&mut history, 3.1, [-102000, -98000, -98000, -98000]);
+    raw_frame(&mut history, 3.2, [-102000, -98000, -98000, -98000]);
+    close(mean(&history, &config, 0, 3.2).unwrap().raw, -102000.0);
+}
+
+#[test]
+fn diagnostics_do_not_create_cg_measurements_and_preferences_keep_the_trace() {
+    let mut panel = crate::balance::ui::Panel::default();
+    panel.config = configured();
+    let mut history = readings([1; 4]);
+    panel.observe(&history, 1.2);
+    history.ingest(1.25, b"debug output\n");
+    panel.observe(&history, 1.25);
+    assert_eq!(panel.trace.points.len(), 1);
+    assert_eq!(panel.trace.points[0].seconds, 1.2);
+    panel.config.auto_zero_on_connect = false;
+    panel.observe(&history, 1.25);
+    assert_eq!(panel.trace.points.len(), 1);
+    panel.config.trace_seconds = 30.0;
+    raw_frame(&mut history, 1.3, [-102000, -98000, -98000, -98000]);
+    panel.observe(&history, 1.3);
+    assert_eq!(panel.trace.points.len(), 2);
+    history.clear();
+    panel.clear_history();
+    panel.observe(&history, 1.3);
+    assert!(panel.trace.points.is_empty());
+}
+
+#[test]
+fn invalid_calibration_cannot_produce_plotted_weights() {
+    let mut config = configured();
+    for invalid in [0.0, 1e-12, f64::NAN, f64::INFINITY] {
+        config.cells[0].counts_per_kg = invalid;
+        let sample = serial_plotter_core::Measurement::Raw { raw: -101000 };
+        assert_eq!(
+            config.value(0, sample, serial_plotter_core::Metric::Kg),
+            None
+        );
+        assert_eq!(
+            config.value(0, sample, serial_plotter_core::Metric::Raw),
+            Some(-101000.0)
+        );
+        assert!(matches!(
+            config.validate(),
+            Err(Error::Calibration(serial_plotter_core::Channel::Lc1))
+        ));
+    }
+}
+
+#[test]
+fn assignment_rejects_invalid_json_at_the_boundary() {
+    for channels in [
+        "[0,0,2,3]",
+        "[0,1,2,4]",
+        "[-1,1,2,3]",
+        "[0,1,2]",
+        "[0,1,2,99999999999999999999]",
+    ] {
+        let json = format!(r#"{{"points":[[1,0],[-1,0],[1,2],[-1,2]],"channels":{channels}}}"#);
+        assert!(serde_json::from_str::<Layout>(&json).is_err(), "{channels}");
+    }
+}
 
 #[test]
 fn point_readings_expire_disconnect_and_recover_without_hiding_other_sensors() {
@@ -11,17 +178,19 @@ fn point_readings_expire_disconnect_and_recover_without_hiding_other_sensors() {
     );
     assert_eq!(
         sensor_reading(&history, &config, 0, 1.2, false, false),
-        SensorReading::Unavailable("disconnected")
+        SensorReading::Unavailable(balance::DataIssue::Disconnected)
     );
     assert_eq!(
         sensor_reading(&history, &config, 0, 1.8, true, false),
-        SensorReading::Unavailable("stale")
+        SensorReading::Unavailable(balance::DataIssue::Stale)
     );
     history.ingest(1.21, b"LC1 status=timeout\n");
     assert!(config.calculate(&history, 1.21).is_err());
     assert_eq!(
         sensor_reading(&history, &config, 0, 1.21, true, false),
-        SensorReading::Unavailable("timeout")
+        SensorReading::Unavailable(balance::DataIssue::Fault(
+            serial_plotter_core::Fault::Timeout
+        ))
     );
     assert_eq!(
         sensor_reading(&history, &config, 1, 1.21, true, false),
@@ -30,7 +199,7 @@ fn point_readings_expire_disconnect_and_recover_without_hiding_other_sensors() {
     history.ingest(1.22, b"LC1 raw=-103000\n");
     assert_eq!(
         sensor_reading(&history, &config, 0, 1.22, true, false),
-        SensorReading::Pending("RX: averaging")
+        SensorReading::Pending(balance::WaitReason::Averaging)
     );
     history.ingest(1.23, b"LC1 raw=-103000\nLC1 raw=-103000\n");
     assert_eq!(
@@ -40,7 +209,7 @@ fn point_readings_expire_disconnect_and_recover_without_hiding_other_sensors() {
     history.transport_gap();
     assert_eq!(
         sensor_reading(&history, &config, 0, 1.23, true, false),
-        SensorReading::Unavailable("data gap")
+        SensorReading::Unavailable(balance::DataIssue::Gap)
     );
 }
 
@@ -66,16 +235,16 @@ fn point_readings_distinguish_zero_pending_from_connection_and_keep_negative_loa
     );
     assert_eq!(
         sensor_reading(&history, &config, 1, 1.2, true, true),
-        SensorReading::Pending("RX: zero needed")
+        SensorReading::Pending(balance::WaitReason::Zero)
     );
     config.cells[1].zero_raw = None;
     assert_eq!(
         sensor_reading(&history, &config, 1, 1.2, true, false),
-        SensorReading::Pending("RX: zero needed")
+        SensorReading::Pending(balance::WaitReason::Zero)
     );
     assert_eq!(
         sensor_reading(&History::default(), &config, 1, 1.2, true, false),
-        SensorReading::Unavailable("no data")
+        SensorReading::Unavailable(balance::DataIssue::NoData)
     );
 }
 
@@ -94,7 +263,7 @@ fn point_assignments_swap_without_moving_coordinates_or_sensor_calibration() {
     let history = readings([1, 2, 3, 4]);
     close(config.calculate(&history, 1.2).unwrap().y_mm, 1400.0);
     config.layout.assign(0, 2).unwrap(); // Upper right: LC1 -> LC3, swaps lower right to LC1.
-    assert_eq!(config.layout.channels, [2, 1, 0, 3]);
+    assert_eq!(<[usize; 4]>::from(config.layout.channels), [2, 1, 0, 3]);
     assert_eq!(config.layout.points, points);
     assert_eq!(config.cells, cells);
     assert_eq!(config.layout.positions()[0], [300.0, 2000.0]);
@@ -130,7 +299,7 @@ fn legacy_dimensions_load_as_points_and_new_settings_have_one_coordinate_source(
         layout.points,
         [[100.0, 0.0], [-100.0, 0.0], [120.0, 210.0], [-80.0, 190.0]]
     );
-    assert_eq!(layout.channels, [2, 3, 0, 1]);
+    assert_eq!(<[usize; 4]>::from(layout.channels), [2, 3, 0, 1]);
     let json = serde_json::to_value(&layout).unwrap();
     assert!(json.get("x1").is_none());
     assert_eq!(
@@ -148,7 +317,7 @@ fn legacy_dimensions_load_as_points_and_new_settings_have_one_coordinate_source(
 #[test]
 fn pc_auto_zero_runs_once_and_restarts_on_device_session_banner() {
     use serial_plotter_core::{Measurement, Metric};
-    let mut panel = crate::balance_ui::Panel::default();
+    let mut panel = crate::balance::ui::Panel::default();
     panel.config = configured();
     panel.begin_session();
     assert!(panel.zero_pending());
@@ -199,7 +368,7 @@ fn pc_auto_zero_runs_once_and_restarts_on_device_session_banner() {
 
 #[test]
 fn manual_pc_zero_preserves_all_offsets_on_failure_and_respects_disabled_auto() {
-    let mut panel = crate::balance_ui::Panel::default();
+    let mut panel = crate::balance::ui::Panel::default();
     panel.config = configured();
     panel.config.auto_zero_on_connect = false;
     panel.begin_session();
@@ -230,7 +399,7 @@ fn manual_pc_zero_preserves_all_offsets_on_failure_and_respects_disabled_auto() 
 
 #[test]
 fn pc_auto_zero_waits_for_all_enabled_sensors_and_fresh_window_after_fault() {
-    let mut panel = crate::balance_ui::Panel::default();
+    let mut panel = crate::balance::ui::Panel::default();
     panel.config = configured();
     panel.begin_session();
     let old = panel.config.clone();
@@ -274,7 +443,7 @@ fn configured() -> Config {
     let mut config = Config {
         layout: Layout {
             points: [[100.0, 0.0], [-100.0, 0.0], [100.0, 200.0], [-100.0, 200.0]],
-            channels: [0, 1, 2, 3],
+            channels: Default::default(),
         },
         ..Config::default()
     };
@@ -309,7 +478,7 @@ fn close(a: f64, b: f64) {
 
 #[test]
 fn fault_and_recovery_inside_one_received_batch_still_breaks_cg_trail() {
-    let mut panel = crate::balance_ui::Panel::default();
+    let mut panel = crate::balance::ui::Panel::default();
     panel.config = configured();
     let mut history = readings([1; 4]);
     panel.observe(&history, 1.2);
@@ -352,12 +521,11 @@ fn requested_layout_formula_and_permuted_channel_assignment() {
     let cg = config.calculate(&readings([1, 2, 3, 4]), 1.2).unwrap();
     close(cg.x_mm, -6.0);
     close(cg.y_mm, 139.0);
-    config.layout.channels = [2, 3, 0, 1];
+    config.layout.channels = Assignment::try_from([2, 3, 0, 1]).unwrap();
     let swapped = config.calculate(&readings([3, 4, 1, 2]), 1.2).unwrap();
     close(swapped.x_mm, cg.x_mm);
     close(swapped.y_mm, cg.y_mm);
-    config.layout.channels = [0, 0, 2, 3];
-    assert!(config.calculate(&readings([1; 4]), 1.2).is_err());
+    assert!(Assignment::try_from([0, 0, 2, 3]).is_err());
 }
 
 #[test]

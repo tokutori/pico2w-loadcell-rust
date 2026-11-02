@@ -35,6 +35,9 @@ pub struct History {
     pub samples: [VecDeque<Sample>; 4],
     pub latest: [Option<Reading>; 4],
     pub line_count: u64,
+    /// Measurement identity is independent of log lines and clearing the display.
+    pub measurement_revision: u64,
+    pub measurement_time: f64,
     pub errors: u64,
     pub last_time: f64,
     pub tare: TareState,
@@ -53,6 +56,8 @@ impl Default for History {
             samples: std::array::from_fn(|_| VecDeque::new()),
             latest: [None; 4],
             line_count: 0,
+            measurement_revision: 0,
+            measurement_time: 0.0,
             errors: 0,
             last_time: 0.0,
             tare: TareState::Unknown,
@@ -67,12 +72,18 @@ impl Default for History {
 }
 
 impl History {
-    pub fn transport_gap(&mut self) {
-        self.framer = Framer::default();
+    /// Unknown corruption may affect any channel. Invalidate averages as well
+    /// as plots until each channel establishes a new contiguous sample window.
+    fn invalidate_all(&mut self) {
         self.gap_pending = [true; 4];
         self.discontinuities
             .iter_mut()
             .for_each(|n| *n = n.wrapping_add(1));
+    }
+
+    pub fn transport_gap(&mut self) {
+        self.framer = Framer::default();
+        self.invalidate_all();
         self.errors += 1;
         self.lines
             .push_back("[monitor: BLE fragment lost; incomplete message discarded]".into());
@@ -119,17 +130,13 @@ impl History {
             match self.framer.push(byte) {
                 Frame::Pending => {}
                 Frame::TooLong => {
-                    self.discontinuities
-                        .iter_mut()
-                        .for_each(|n| *n = n.wrapping_add(1));
+                    self.invalidate_all();
                     self.errors += 1;
                     self.lines
                         .push_back("[monitor: overlong line discarded (4096-byte limit)]".into());
                 }
                 Frame::InvalidUtf8 => {
-                    self.discontinuities
-                        .iter_mut()
-                        .for_each(|n| *n = n.wrapping_add(1));
+                    self.invalidate_all();
                     self.errors += 1;
                     self.lines.push_back("[monitor: invalid UTF-8 line]".into());
                 }
@@ -138,6 +145,8 @@ impl History {
                     self.lines.push_back(line.to_owned());
                     match parse_line(line) {
                         Ok(Some(reading)) => {
+                            self.measurement_revision = self.measurement_revision.wrapping_add(1);
+                            self.measurement_time = seconds;
                             let i = reading.channel.index();
                             if valid_raw(reading.measurement).is_none() {
                                 self.discontinuities[i] = self.discontinuities[i].wrapping_add(1);
@@ -157,16 +166,12 @@ impl History {
                             Ok(None) => {}
                             Err(_) => {
                                 self.errors += 1;
-                                self.discontinuities
-                                    .iter_mut()
-                                    .for_each(|n| *n = n.wrapping_add(1));
+                                self.invalidate_all();
                             }
                         },
                         Err(_) => {
                             self.errors += 1;
-                            self.discontinuities
-                                .iter_mut()
-                                .for_each(|n| *n = n.wrapping_add(1));
+                            self.invalidate_all();
                         }
                     }
                 }
