@@ -157,12 +157,26 @@ impl Panel {
                 zero_captured = self.zero_error.is_none();
             }
             ui.menu_button("Zero options", |ui| {
+                ui.strong("Sensors to zero / use");
+                ui.horizontal(|ui| {
+                    for (i, cell) in self.config.cells.iter_mut().enumerate() {
+                        if ui.add_enabled(!demo, egui::Checkbox::new(&mut cell.enabled, format!("LC{}", i + 1))).changed() {
+                            self.dirty = true;
+                            self.zero_error = None;
+                            self.trace = Trace::default();
+                            self.auto_zero.interrupt_window();
+                            zero_captured = true;
+                        }
+                    }
+                });
+                ui.label("Select connected sensors; one sensor is enough to zero.");
+                ui.label("Shared with Use in calibration. Keep every platform support enabled for CG.");
+                ui.separator();
                 if ui.add_enabled(!demo, egui::Checkbox::new(&mut self.config.auto_zero_on_connect, "Auto zero on connection")).changed() {
                     self.dirty = true;
                     if !self.config.auto_zero_on_connect { self.auto_zero = AutoZero::Inactive; }
                 }
                 ui.label("Auto zero applies at the next connection/session. Keep the empty platform still.");
-                ui.label("Choose supporting sensors in Sensor settings / calibration.");
                 ui.separator();
                 ui.label(&self.message);
             });

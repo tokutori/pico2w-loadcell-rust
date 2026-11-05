@@ -1,6 +1,34 @@
 use crate::{balance, balance::*, history::History};
 
 #[test]
+fn one_connected_sensor_can_zero_manually_and_automatically() {
+    let mut panel = ui::Panel::default();
+    for (i, cell) in panel.config.cells.iter_mut().enumerate() {
+        cell.enabled = i == 0;
+        cell.zero_raw = None;
+    }
+    let mut history = History::default();
+    panel.begin_session();
+    for n in 0..15 {
+        let now = f64::from(n) * 0.1;
+        history.ingest(
+            now,
+            b"LC1 raw=-123456\nLC2 status=timeout\nLC3 status=timeout\nLC4 status=timeout\n",
+        );
+        panel.observe(&history, now);
+    }
+    assert!(!panel.zero_pending());
+    assert_eq!(panel.config.cells[0].zero_raw, Some(-123456.0));
+    assert!(panel.config.cells[1..].iter().all(|c| c.zero_raw.is_none()));
+    history.ingest(1.5, b"LC1 raw=-123456\n");
+    panel.capture_zero(&history, 1.5).unwrap();
+    assert_eq!(panel.config.cells[0].zero_raw, Some(-123456.0));
+    panel.config.cells[1].enabled = true;
+    assert!(panel.capture_zero(&history, 1.5).is_err());
+    assert_eq!(panel.config.cells[0].zero_raw, Some(-123456.0));
+}
+
+#[test]
 fn four_sensor_total_works_at_zero_and_without_valid_cg_geometry() {
     let mut config = configured();
     close(
