@@ -128,7 +128,7 @@ impl Panel {
             metric_card(
                 &mut cols[0],
                 "TOTAL LOAD",
-                total.as_ref().ok().map(|t| format!("{:.3}", t.kgf)),
+                total.as_ref().ok().map(|t| format!("{:.5}", t.kgf)),
                 "kgf",
                 "All four supports, after PC zero. 1 kgf = 9.80665 N under standard gravity.",
             );
@@ -216,7 +216,7 @@ impl Panel {
                     let color = if active && enabled { COLORS[i] } else { egui::Color32::GRAY };
                     let reading = balance::sensor_reading(history, &self.config, i, now, active, self.zero_pending());
                     let (value, state, hint) = match reading {
-                        balance::SensorReading::Load { kg, nominal } => (format!("{kg:.3}"), if nominal { "Nominal" } else { "" }, "Current PC calibrated average".to_owned()),
+                        balance::SensorReading::Load { kg, nominal } => (format!("{kg:.5}"), if nominal { "Nominal" } else { "" }, "Current PC calibrated average".to_owned()),
                         balance::SensorReading::Pending(reason) => ("--".into(), "Waiting", reason.to_string()),
                         balance::SensorReading::Unavailable(reason) => ("--".into(), if active { "No data" } else { "" }, reason.to_string()),
                     };
@@ -735,7 +735,7 @@ impl Panel {
                         }
                     }
                     format!(
-                        "RX: {kg:.2} kgf{}{}",
+                        "RX: {kg:.5} kgf{}{}",
                         if nominal { "*" } else { "" },
                         if kg < 0.0 { " !" } else { "" }
                     )

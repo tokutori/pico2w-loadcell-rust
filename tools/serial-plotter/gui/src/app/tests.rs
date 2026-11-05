@@ -103,7 +103,7 @@ fn full_window_plots_fit_with_and_without_log() {
                 }
                 assert!(
                     text.iter()
-                        .any(|(t, r)| t == "100.000" && r.height() >= 24.0)
+                        .any(|(t, r)| t == "100.00000" && r.height() >= 24.0)
                 );
             }
         }
@@ -130,7 +130,7 @@ fn offline_window_has_one_disconnect_badge_and_no_stale_load() {
     assert!(
         !text
             .iter()
-            .any(|(t, _)| t == "100.000" || t.contains("CG unavailable"))
+            .any(|(t, _)| t == "100.00000" || t.contains("CG unavailable"))
     );
     assert_eq!(text.iter().filter(|(t, _)| t == "-- kgf").count(), 4);
 }
@@ -154,7 +154,7 @@ fn live_fault_and_zeroing_remain_visible_without_repeating_global_state() {
     let text = visible_text(&window_frame(&mut app, &ctx, size));
     assert_eq!(text.iter().filter(|(t, _)| t == "LC3: timeout").count(), 1);
     assert_eq!(text.iter().filter(|(t, _)| t == "Connected").count(), 1);
-    assert!(text.iter().any(|(t, _)| t == "10.000 kgf"));
+    assert!(text.iter().any(|(t, _)| t == "10.00000 kgf"));
     assert!(text.iter().any(|(t, _)| t == "-- kgf"));
     app.balance.config.auto_zero_on_connect = true;
     app.balance.begin_session();
@@ -163,7 +163,7 @@ fn live_fault_and_zeroing_remain_visible_without_repeating_global_state() {
         text.iter().filter(|(t, _)| t.contains("Zeroing:")).count(),
         1
     );
-    assert!(!text.iter().any(|(t, _)| t == "100.000"));
+    assert!(!text.iter().any(|(t, _)| t == "100.00000"));
 }
 
 #[test]
